@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VEL — Sistema de Protección Criptográfica E2EE</title>
+    <meta name="description" content="Aplicación de seguridad y protección de la información con dos dispositivos (VEL CORE y VEL MÓVIL), cifrado E2EE AES-GCM, WebSockets autenticados y custodia local." />
+    <meta property="og:title" content="VEL — Sistema de Protección Criptográfica E2EE" />
+    <meta property="og:description" content="Aplicación de seguridad y protección de la información con dos dispositivos (VEL CORE y VEL MÓVIL), cifrado E2EE AES-GCM, WebSockets autenticados y custodia local." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <!-- PWA Configuration -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#0B1220" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="VEL" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js', { scope: '/' })
+            .then((reg) => {
+              window.__velSwRegistration = reg;
+              reg.addEventListener('updatefound', () => {
+                const newWorker = reg.installing;
+                if (!newWorker) return;
+                newWorker.addEventListener('statechange', () => {
+                  if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                    window.dispatchEvent(new CustomEvent('vel-sw-update-ready', { detail: { registration: reg } }));
+                  }
+                });
+              });
+              document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') {
+                  reg.update().catch(() => {});
+                }
+              });
+            })
+            .catch((err) => {
+              console.warn('Registro de Service Worker:', err);
+            });
+        });
+      }
+    </script>
+  </body>
+</html>
+
