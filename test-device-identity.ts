@@ -667,6 +667,211 @@ async function runTests() {
     (globalThis as any).fetch = originalGlobalFetch;
   }
 
+  // ------------------------------------------------------------------
+  // 11. Regresión: "Completar registro en la nube" real, errores explícitos y recuperación 409 mismo UID
+  // ------------------------------------------------------------------
+  console.log('\n--- 11. Regresión de reintento real y diagnóstico de configuración ---');
+  const diagStorage = createPersistentStorageStub();
+  const diagMaterial = await generateDeviceCryptoMaterial('CORE');
+  const diagUid = 'anon-uid-core-retry-diag-1';
+  await diagStorage.saveIdentity({
+    id: 'current',
+    deviceId: diagMaterial.deviceId,
+    role: 'CORE',
+    fingerprint: diagMaterial.fingerprint,
+    publicKeySpkiBase64: diagMaterial.publicKeySpkiBase64,
+    signingPublicKeySpkiBase64: diagMaterial.signingPublicKeySpkiBase64,
+    privateEcdhKey: diagMaterial.ecdhKeyPair.privateKey,
+    privateSigningKey: diagMaterial.signingKeyPair.privateKey,
+    firebaseAuthUid: null,
+    registrationStatus: 'pending_local',
+    activeLinkId: null,
+    pairedPeerDeviceId: null,
+    lastServerError: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  });
+
+  // 11a. Error real si Firebase Anonymous Auth está deshabilitado en consola (nunca inventa éxito)
+  const disabledAuthRetry = await retryPendingDeviceRegistration({
+    storage: diagStorage,
+    ensureAnonymousAuth: async () => ({
+      success: false,
+      providerDisabled: true,
+      errorCode: 'auth/operation-not-allowed',
+      errorMessage: 'Firebase Anonymous Authentication no está habilitado en Firebase Console para proyecto-vel (auth/operation-not-allowed).'
+    })
+  });
+  assert(
+    !disabledAuthRetry.success &&
+      !disabledAuthRetry.registeredInServer &&
+      disabledAuthRetry.requiresExternalConfig === true &&
+      (disabledAuthRetry.error || '').includes('Anonymous Authentication') &&
+      disabledAuthRetry.identity?.registrationStatus === 'pending_local',
+    'Fallo de Firebase Anonymous Auth no simula éxito, marca requiresExternalConfig y conserva pending_local'
+  );
+
+  // 11b. Error real 503 FIREBASE_SERVICE_ACCOUNT pendiente en Netlify (incluye variable faltante)
+  const missingSaRetry = await retryPendingDeviceRegistration({
+    storage: diagStorage,
+    ensureAnonymousAuth: async () => ({
+      success: true,
+      uid: diagUid,
+      idToken: `valid-token-${diagUid}`
+    }),
+    fetchFn: async (input, init) => {
+      const url = String(input);
+      if (url.startsWith('/api/register-device')) {
+        const res = await registerDeviceHandler(
+          {
+            httpMethod: init?.method || 'POST',
+            headers: init?.headers || {},
+            body: typeof init?.body === 'string' ? init.body : undefined
+          },
+          {
+            verifyToken: async () => ({ authenticated: true, uid: diagUid, email: '' }),
+            hasDbCredentials: () => false
+          }
+        );
+        return new Response(res.body, { status: res.statusCode, headers: (res.headers || { 'Content-Type': 'application/json' }) as Record<string, string> });
+      }
+      throw new Error(`Ruta inesperada: ${url}`);
+    }
+  });
+  assert(
+    !missingSaRetry.success &&
+      !missingSaRetry.registeredInServer &&
+      missingSaRetry.requiresExternalConfig === true &&
+      (missingSaRetry.error || '').includes('FIREBASE_SERVICE_ACCOUNT') &&
+      missingSaRetry.identity?.registrationStatus === 'pending_local',
+    'HTTP 503 por FIREBASE_SERVICE_ACCOUNT faltante informa variable exacta y no simula registro exitoso'
+  );
+
+  // 11c. Recuperación legítima cuando Firestore ya tiene el documento del mismo authUid (409 -> /api/device-session 200)
+  await registerDeviceHandler(
+    {
+      httpMethod: 'POST',
+      headers: { Authorization: `Bearer valid-token-${diagUid}` },
+      body: JSON.stringify({
+        deviceId: diagMaterial.deviceId,
+        role: 'CORE',
+        publicKeySpkiBase64: diagMaterial.publicKeySpkiBase64,
+        signingPublicKeySpkiBase64: diagMaterial.signingPublicKeySpkiBase64,
+        fingerprint: diagMaterial.fingerprint
+      })
+    },
+    {
+      verifyToken: async () => ({ authenticated: true, uid: diagUid, email: '' }),
+      hasDbCredentials: () => true,
+      getDeviceStore: () => dbMemory.store
+    }
+  );
+
+  // Primero comprobar que otro UID distinto NO puede recuperar ese 409
+  const hijacked409Retry = await retryPendingDeviceRegistration({
+    storage: diagStorage,
+    ensureAnonymousAuth: async () => ({
+      success: true,
+      uid: 'different-attacker-uid',
+      idToken: 'valid-token-attacker'
+    }),
+    fetchFn: async (input, init) => {
+      const url = String(input);
+      const authHeader = (init?.headers as Record<string, string>)?.Authorization || '';
+      if (url.startsWith('/api/register-device')) {
+        const res = await registerDeviceHandler(
+          {
+            httpMethod: 'POST',
+            headers: { Authorization: authHeader },
+            body: typeof init?.body === 'string' ? init.body : undefined
+          },
+          {
+            verifyToken: async () => ({ authenticated: true, uid: 'different-attacker-uid', email: '' }),
+            hasDbCredentials: () => true,
+            getDeviceStore: () => dbMemory.store
+          }
+        );
+        return new Response(res.body, { status: res.statusCode, headers: (res.headers || { 'Content-Type': 'application/json' }) as Record<string, string> });
+      }
+      if (url.startsWith('/api/device-session')) {
+        const query = url.includes('?') ? url.split('?')[1] : '';
+        const params = new URLSearchParams(query);
+        const res = await deviceSessionHandler(
+          {
+            httpMethod: 'GET',
+            headers: { Authorization: authHeader },
+            queryStringParameters: Object.fromEntries(params.entries())
+          },
+          {
+            verifyToken: async () => ({ authenticated: true, uid: 'different-attacker-uid', email: '' }),
+            hasDbCredentials: () => true,
+            getDeviceStore: () => dbMemory.store
+          }
+        );
+        return new Response(res.body, { status: res.statusCode, headers: (res.headers || { 'Content-Type': 'application/json' }) as Record<string, string> });
+      }
+      throw new Error(`Ruta inesperada: ${url}`);
+    }
+  });
+  assert(
+    !hijacked409Retry.success && hijacked409Retry.identity?.registrationStatus === 'pending_local',
+    'Un UID distinto que recibe 409 sigue siendo rechazado y no obtiene acceso al dispositivo'
+  );
+
+  // Ahora el mismo authUid propietario sí sincroniza su estado real en Firestore
+  const sameUid409Retry = await retryPendingDeviceRegistration({
+    storage: diagStorage,
+    ensureAnonymousAuth: async () => ({
+      success: true,
+      uid: diagUid,
+      idToken: `valid-token-${diagUid}`
+    }),
+    fetchFn: async (input, init) => {
+      const url = String(input);
+      const authHeader = (init?.headers as Record<string, string>)?.Authorization || '';
+      if (url.startsWith('/api/register-device')) {
+        const res = await registerDeviceHandler(
+          {
+            httpMethod: 'POST',
+            headers: { Authorization: authHeader },
+            body: typeof init?.body === 'string' ? init.body : undefined
+          },
+          {
+            verifyToken: async () => ({ authenticated: true, uid: diagUid, email: '' }),
+            hasDbCredentials: () => true,
+            getDeviceStore: () => dbMemory.store
+          }
+        );
+        return new Response(res.body, { status: res.statusCode, headers: (res.headers || { 'Content-Type': 'application/json' }) as Record<string, string> });
+      }
+      if (url.startsWith('/api/device-session')) {
+        const query = url.includes('?') ? url.split('?')[1] : '';
+        const params = new URLSearchParams(query);
+        const res = await deviceSessionHandler(
+          {
+            httpMethod: 'GET',
+            headers: { Authorization: authHeader },
+            queryStringParameters: Object.fromEntries(params.entries())
+          },
+          {
+            verifyToken: async () => ({ authenticated: true, uid: diagUid, email: '' }),
+            hasDbCredentials: () => true,
+            getDeviceStore: () => dbMemory.store
+          }
+        );
+        return new Response(res.body, { status: res.statusCode, headers: (res.headers || { 'Content-Type': 'application/json' }) as Record<string, string> });
+      }
+      throw new Error(`Ruta inesperada: ${url}`);
+    }
+  });
+  assert(
+    sameUid409Retry.success &&
+      sameUid409Retry.registeredInServer &&
+      sameUid409Retry.identity?.registrationStatus === 'registered' &&
+      sameUid409Retry.identity?.lastServerError === null,
+    'Si Firestore ya registró el deviceId del mismo authUid (409 tras caída de red), /api/device-session recupera el estado real registered'
+  );
+
   console.log('\n==================================================================');
   console.log(`RESUMEN DE PRUEBAS IDENTIDAD Y FIREBASE: ${passed} PASS / ${failed} FAIL`);
   console.log('==================================================================');
