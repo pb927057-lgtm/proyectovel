@@ -28,7 +28,9 @@ import {
   Database,
   Trash2,
   Eye,
-  EyeOff
+  EyeOff,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 import {
   DeviceIdentitySummary,
@@ -79,10 +81,19 @@ import {
   PWAInstallButton,
   SWUpdateBanner
 } from './components/PWAInstallBanner';
+import { coreFileVault } from './db/coreFileVault';
+import {
+  FileTransferService,
+  FileTransferSnapshot
+} from './services/fileTransferService';
+import { CoreBinaryVaultPanel } from './components/CoreBinaryVaultPanel';
+import { MobileFileTransferPanel } from './components/MobileFileTransferPanel';
 
 export type ScreenType =
   | 'WELCOME'
-  | 'ROLE_SELECTION'
+  | 'EXPLAIN_CORE'
+  | 'EXPLAIN_MOVIL'
+  | 'SECOND_PHONE_GUIDE'
   | 'SETUP_CORE'
   | 'SETUP_MOVIL'
   | 'CORE_HOME'
@@ -97,6 +108,7 @@ export function App() {
   // Modos de vista: PWA VEL (Dispositivo), Portal Web (Contratación) e Instalación
   const [viewMode, setViewMode] = useState<'PHONE_PREVIEW' | 'WEB_PORTAL' | 'INSTALL_INFO'>('PHONE_PREVIEW');
   const [currentScreen, setCurrentScreen] = useState<ScreenType>('WELCOME');
+  const [screenHistory, setScreenHistory] = useState<ScreenType[]>([]);
 
   // Modales de información, emergencia y cambio controlado de rol
   const [showHelpModal, setShowHelpModal] = useState(false);
@@ -106,6 +118,77 @@ export function App() {
   const [roleChangeError, setRoleChangeError] = useState<string | null>(null);
   const [isChangingRole, setIsChangingRole] = useState(false);
 
+  // Apartados colapsables de información técnica avanzada (ocultos por defecto en la vista habitual)
+  const [showSetupAdvancedTech, setShowSetupAdvancedTech] = useState(false);
+  const [showCoreAdvancedTech, setShowCoreAdvancedTech] = useState(false);
+  const [showTerminalAdvancedTech, setShowTerminalAdvancedTech] = useState(false);
+  const [showPairingAdvancedTech, setShowPairingAdvancedTech] = useState(false);
+  const [showManageAdvancedTech, setShowManageAdvancedTech] = useState(false);
+  const [showReplaceAdvancedTech, setShowReplaceAdvancedTech] = useState(false);
+  const [pairingFormError, setPairingFormError] = useState<string | null>(null);
+  const [publicUrlCopyStatus, setPublicUrlCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+
+  const publicVelUrl = typeof window !== 'undefined' ? window.location.origin : '';
+
+  const handleCopyPublicVelUrl = async () => {
+    if (!publicVelUrl) {
+      setPublicUrlCopyStatus('error');
+      return;
+    }
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(publicVelUrl);
+        setPublicUrlCopyStatus('copied');
+        setTimeout(() => setPublicUrlCopyStatus('idle'), 2600);
+        return;
+      }
+      const textarea = document.createElement('textarea');
+      textarea.value = publicVelUrl;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      if (copied) {
+        setPublicUrlCopyStatus('copied');
+        setTimeout(() => setPublicUrlCopyStatus('idle'), 2600);
+      } else {
+        setPublicUrlCopyStatus('error');
+      }
+    } catch {
+      setPublicUrlCopyStatus('error');
+    }
+  };
+
+  const navigateTo = (next: ScreenType) => {
+    setCurrentScreen((prev) => {
+      if (prev !== next) {
+        setScreenHistory((hist) => [...hist, prev]);
+      }
+      return next;
+    });
+  };
+
+  const goBack = (fallback: ScreenType = 'WELCOME') => {
+    setScreenHistory((hist) => {
+      if (hist.length === 0) {
+        setCurrentScreen(fallback);
+        return hist;
+      }
+      const prev = hist[hist.length - 1];
+      setCurrentScreen(prev);
+      return hist.slice(0, -1);
+    });
+  };
+
+  const goHome = () => {
+    setViewMode('PHONE_PREVIEW');
+    setScreenHistory([]);
+    setCurrentScreen('WELCOME');
+  };
+
   // Estado real de identidad técnica del dispositivo (IndexedDB + Web Crypto + Firebase/Firestore)
   const [isLoadingIdentity, setIsLoadingIdentity] = useState(true);
   const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentitySummary | null>(null);
@@ -114,6 +197,19 @@ export function App() {
   const [setupError, setSetupError] = useState<string | null>(null);
   const [requiresExternalConfig, setRequiresExternalConfig] = useState(false);
   const [isRetryingSync, setIsRetryingSync] = useState(false);
+
+  const isActiveRegisteredCore = Boolean(
+    deviceIdentity &&
+      deviceIdentity.role === 'CORE' &&
+      (deviceIdentity.registrationStatus === 'registered' ||
+        deviceIdentity.registrationStatus === 'paired')
+  );
+
+  useEffect(() => {
+    if (!isLoadingIdentity && currentScreen === 'EXPLAIN_CORE' && isActiveRegisteredCore) {
+      setCurrentScreen('CORE_HOME');
+    }
+  }, [isLoadingIdentity, currentScreen, isActiveRegisteredCore]);
 
   // PWA & Conectividad
   const pwa = usePWAInstall();
@@ -140,6 +236,13 @@ export function App() {
   const [relaySnapshot, setRelaySnapshot] = useState<RelayClientSnapshot>(() =>
     relayClientRef.current!.getSnapshot()
   );
+  const [fileTransferService, setFileTransferService] = useState<FileTransferService | null>(null);
+  const [fileTransferSnapshot, setFileTransferSnapshot] = useState<FileTransferSnapshot>({
+    outgoing: [],
+    incoming: [],
+    hasActiveTransfer: false
+  });
+  const [coreBinaryVaultRevision, setCoreBinaryVaultRevision] = useState(0);
   const PRODUCTION_RELAY_WSS_URL = 'wss://server-vel.onrender.com';
 
   const getCompiledOrDefaultRelayConfig = (): RelayServerConfigResponse => {
@@ -207,6 +310,15 @@ export function App() {
 
   useEffect(() => {
     const client = relayClientRef.current!;
+    const transferSvc = new FileTransferService({
+      relayClient: client,
+      coreVault: coreFileVault,
+      onCoreVaultUpdated: () => setCoreBinaryVaultRevision((v) => v + 1)
+    });
+    setFileTransferService(transferSvc);
+    const unsubscribeTransfer = transferSvc.subscribe((transferSnap) => {
+      setFileTransferSnapshot(transferSnap);
+    });
     const unsubscribe = client.subscribe((snap) => {
       setRelaySnapshot(snap);
       if (snap.identity) {
@@ -216,6 +328,9 @@ export function App() {
     void loadRelayConfiguration();
 
     return () => {
+      unsubscribeTransfer();
+      transferSvc.dispose();
+      setFileTransferService(null);
       unsubscribe();
       client.disconnect();
     };
@@ -321,10 +436,10 @@ export function App() {
   const handleSaveCoreVaultNote = async (e: React.FormEvent) => {
     e.preventDefault();
     if (deviceIdentity?.role !== 'CORE') return;
-    const title = vaultNoteTitle.trim() || 'Registro confidencial';
+    const title = vaultNoteTitle.trim() || 'Nota protegida';
     const content = vaultNoteBody.trim();
     if (!content) {
-      setVaultError('Ingresa un contenido para guardar cifrado en tu VEL CORE.');
+      setVaultError('Falta escribir el contenido que deseas guardar. Es obligatorio para protegerlo en tu VEL CORE.');
       return;
     }
     setIsSavingVaultNote(true);
@@ -420,9 +535,22 @@ export function App() {
 
   const handleClaimPairingCode = async (e: React.FormEvent) => {
     e.preventDefault();
+    setPairingFormError(null);
+    const cleanCode = pairingCodeInput.trim();
+    if (!cleanCode) {
+      setPairingFormError('Falta ingresar el código de invitación temporal de 8 caracteres (formato XXXX-XXXX). Solicítalo en «Vincular» desde tu VEL CORE.');
+      return;
+    }
+    if (relaySnapshot.connectionState !== 'AUTHENTICATED') {
+      setPairingFormError('El servicio de comunicación aún no está listo. Espera un momento o pulsa «Reconectar».');
+      return;
+    }
     setIsClaimingPairing(true);
     try {
-      await relayClientRef.current!.claimPairingOffer(pairingCodeInput);
+      const outcome = await relayClientRef.current!.claimPairingOffer(cleanCode);
+      if (!outcome.success && outcome.error) {
+        setPairingFormError(outcome.error);
+      }
     } finally {
       setIsClaimingPairing(false);
     }
@@ -430,20 +558,20 @@ export function App() {
 
   const handleSendE2eeVerification = async (e?: React.FormEvent, overrideText?: string) => {
     if (e) e.preventDefault();
-    const textToSend = (
-      overrideText ??
-      (e2eeMessageInput.trim() ||
-        `Verificación técnica E2EE VEL (${deviceIdentity?.role || 'PEER'}) • ${new Date().toLocaleTimeString()}`)
-    ).trim();
+    const textToSend = (overrideText ?? e2eeMessageInput).trim();
+    if (!textToSend) {
+      setE2eeNotice('Falta escribir el mensaje. Es obligatorio ingresar un texto para enviarlo protegido a tu otro dispositivo.');
+      return;
+    }
     setIsSendingE2ee(true);
     setE2eeNotice(null);
     try {
       const outcome = await relayClientRef.current!.sendEncryptedMessage(
         textToSend,
-        overrideText ? 'Reintento técnico E2EE' : textToSend.slice(0, 42)
+        overrideText ? 'Reintento de envío' : textToSend.slice(0, 42)
       );
       if (!outcome.accepted) {
-        setE2eeNotice(outcome.error || 'No se pudo enviar el paquete cifrado.');
+        setE2eeNotice(outcome.error || 'No se pudo enviar el mensaje en este momento.');
       } else if (!overrideText) {
         setE2eeMessageInput('');
       }
@@ -534,12 +662,67 @@ export function App() {
     }
   };
 
+  const formatFriendlyStepLabel = (step: SetupProgressStep['step'], status: SetupProgressStep['status']) => {
+    switch (step) {
+      case 'storage':
+        return {
+          title: 'Almacenamiento seguro del dispositivo',
+          detail: status === 'done' ? 'Espacio protegido preparado en este teléfono.' : 'Preparando almacenamiento seguro...'
+        };
+      case 'crypto':
+        return {
+          title: 'Protección privada del dispositivo',
+          detail: status === 'done' ? 'Claves de seguridad creadas y protegidas en este equipo.' : 'Generando protección privada...'
+        };
+      case 'firebase_auth':
+        return {
+          title: 'Verificación de acceso',
+          detail:
+            status === 'done'
+              ? 'Sesión de dispositivo verificada sin contraseña.'
+              : status === 'error'
+              ? 'No se pudo verificar el acceso en este momento.'
+              : 'Verificando acceso del dispositivo...'
+        };
+      case 'backend_register':
+      default:
+        return {
+          title: 'Registro del dispositivo',
+          detail:
+            status === 'done'
+              ? 'Dispositivo registrado correctamente.'
+              : status === 'error'
+              ? 'El registro en la nube quedó pendiente. Tus datos locales siguen a salvo.'
+              : 'Completando registro en la nube...'
+        };
+    }
+  };
+
+  const formatRelaySimpleStatus = (state: RelayConnectionState) => {
+    switch (state) {
+      case 'LINKED':
+      case 'AUTHENTICATED':
+        return { label: 'Conectado', cls: 'text-[#10B981]' };
+      case 'CONNECTING':
+      case 'CONNECTED_UNAUTHENTICATED':
+      case 'AUTHENTICATING':
+      case 'RECONNECTING':
+        return { label: 'Conectando...', cls: 'text-[#F59E0B]' };
+      case 'REVOKED':
+        return { label: 'Acceso revocado', cls: 'text-[#EF4444]' };
+      case 'ERROR':
+      case 'DISCONNECTED':
+      default:
+        return { label: 'Sin conexión', cls: 'text-[#94A3B8]' };
+    }
+  };
+
   const handleApplySetupOutcome = (result: DeviceSetupResult) => {
     if (result.identity) {
       setDeviceIdentity(result.identity);
     }
     if (!result.success) {
-      setSetupError(result.error || 'No se pudo completar el registro en Firebase/Firestore.');
+      setSetupError(result.error || 'No se pudo completar el registro en la nube.');
       setRequiresExternalConfig(Boolean(result.requiresExternalConfig));
     } else {
       setSetupError(null);
@@ -547,11 +730,42 @@ export function App() {
     }
   };
 
+  const buildCompletedStepsForExisting = (identity: DeviceIdentitySummary): SetupProgressStep[] => {
+    const isRegistered = identity.registrationStatus !== 'pending_local';
+    return [
+      { step: 'storage', status: 'done', detail: 'Almacenamiento local listo.' },
+      { step: 'crypto', status: 'done', detail: 'Identidad protegida en el dispositivo.' },
+      { step: 'firebase_auth', status: identity.firebaseAuthUid ? 'done' : 'pending', detail: 'Acceso verificado.' },
+      {
+        step: 'backend_register',
+        status: isRegistered ? 'done' : 'error',
+        detail: isRegistered ? 'Dispositivo registrado.' : 'Registro remoto pendiente.'
+      }
+    ];
+  };
+
   const handleStartDeviceSetup = async (role: DeviceRole) => {
     setSetupError(null);
     setRequiresExternalConfig(false);
+
+    // Si este dispositivo ya tiene una identidad guardada, conservarla intacta sin regenerar nada
+    if (deviceIdentity) {
+      setSetupSteps(buildCompletedStepsForExisting(deviceIdentity));
+      if (deviceIdentity.role === role) {
+        if (deviceIdentity.registrationStatus !== 'pending_local') {
+          navigateTo(role === 'CORE' ? 'CORE_HOME' : 'TERMINAL_HOME');
+          return;
+        }
+        navigateTo(role === 'CORE' ? 'SETUP_CORE' : 'SETUP_MOVIL');
+        return;
+      }
+      // Si el usuario tiene CORE e intenta configurar MÓVIL (o viceversa), abrir pantalla explicativa con aviso sin sobrescribir IndexedDB ni redirigir al otro flujo
+      navigateTo(role === 'CORE' ? 'EXPLAIN_CORE' : 'EXPLAIN_MOVIL');
+      return;
+    }
+
     setIsSettingUpDevice(true);
-    setCurrentScreen(role === 'CORE' ? 'SETUP_CORE' : 'SETUP_MOVIL');
+    navigateTo(role === 'CORE' ? 'SETUP_CORE' : 'SETUP_MOVIL');
 
     try {
       const result = await setupNewDeviceIdentity(role, (steps) => {
@@ -559,7 +773,7 @@ export function App() {
       });
       handleApplySetupOutcome(result);
     } catch (err: any) {
-      setSetupError(err?.message || 'Error inesperado al configurar la identidad técnica.');
+      setSetupError(err?.message || 'Error inesperado al configurar este teléfono.');
     } finally {
       setIsSettingUpDevice(false);
     }
@@ -572,7 +786,7 @@ export function App() {
       const result = await retryPendingDeviceRegistration();
       handleApplySetupOutcome(result);
     } catch (err: any) {
-      setSetupError(err?.message || 'Error al reintentar el registro en Firebase/Firestore.');
+      setSetupError(err?.message || 'Error al reintentar el registro en la nube.');
     } finally {
       setIsRetryingSync(false);
     }
@@ -590,7 +804,7 @@ export function App() {
         }
       }
     } catch (err: any) {
-      setSetupError(err?.message || 'No se pudo verificar la sesión técnica en Firestore.');
+      setSetupError(err?.message || 'No se pudo comprobar el estado del dispositivo.');
     } finally {
       setIsRetryingSync(false);
     }
@@ -599,6 +813,10 @@ export function App() {
   const handleExecuteControlledRoleChange = async (e: React.FormEvent) => {
     e.preventDefault();
     setRoleChangeError(null);
+    if (!roleChangeConfirmInput.trim()) {
+      setRoleChangeError(`Falta escribir exactamente ${ROLE_CHANGE_CONFIRMATION_KEYWORD}. Es necesario para confirmar el cambio de función de este teléfono.`);
+      return;
+    }
     setIsChangingRole(true);
 
     try {
@@ -617,6 +835,7 @@ export function App() {
       setRevokeFeedback(null);
       setRoleChangeConfirmInput('');
       setShowRoleChangeModal(false);
+      setScreenHistory([]);
       setCurrentScreen('WELCOME');
     } catch (err: any) {
       setRoleChangeError(err?.message || 'No se pudo completar el cambio controlado de rol.');
@@ -900,6 +1119,7 @@ export function App() {
 
         if (persisted) {
           setDeviceIdentity(persisted);
+          setSetupSteps(buildCompletedStepsForExisting(persisted));
           setCurrentScreen(persisted.role === 'CORE' ? 'CORE_HOME' : 'TERMINAL_HOME');
           setIsLoadingIdentity(false);
 
@@ -923,7 +1143,7 @@ export function App() {
         }
       } catch (err: any) {
         if (!active) return;
-        setSetupError(err?.message || 'Error al cargar la identidad técnica local.');
+        setSetupError(err?.message || 'Error al cargar la configuración local.');
         setCurrentScreen('WELCOME');
         setIsLoadingIdentity(false);
       }
@@ -1024,8 +1244,12 @@ export function App() {
     setAuthSuccess(null);
 
     const email = authEmail.trim();
-    if (!email || !email.includes('@')) {
-      setAuthError('Por favor ingresa un correo electrónico válido.');
+    if (!email) {
+      setAuthError('Falta ingresar tu correo electrónico. Es necesario para enviarte el enlace único de acceso sin contraseña.');
+      return;
+    }
+    if (!email.includes('@')) {
+      setAuthError('El correo electrónico ingresado no parece válido. Revisa el formato (por ejemplo, nombre@correo.com).');
       return;
     }
 
@@ -1050,7 +1274,7 @@ export function App() {
 
     const email = confirmLinkEmailInput.trim();
     if (!email || !email.includes('@')) {
-      setAuthError('Ingresa el mismo correo electrónico en el que recibiste el enlace.');
+      setAuthError('Falta confirmar un correo electrónico válido. Debe coincidir con el correo donde recibiste el enlace.');
       return;
     }
 
@@ -1162,7 +1386,7 @@ export function App() {
   const commercialStatusBadge = (() => {
     if (!currentUser) {
       return {
-        label: 'Sesión comercial no iniciada en este navegador',
+        label: 'Sin sesión comercial abierta',
         cls: 'bg-[#94A3B8]/15 text-[#94A3B8] border-[#94A3B8]/30'
       };
     }
@@ -1175,41 +1399,41 @@ export function App() {
         : null;
       if (daysLeft !== null && daysLeft <= 7) {
         return {
-          label: `Comercial: Próximo a vencer (${daysLeft} d)`,
+          label: `Próxima a vencer (${daysLeft} d)`,
           cls: 'bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/30'
         };
       }
       return {
-        label: 'Comercial: Activo',
+        label: 'Activa',
         cls: 'bg-[#10B981]/15 text-[#10B981] border-[#10B981]/30'
       };
     }
     if (est === 'en_gracia') {
       return {
-        label: 'Comercial: Período de gracia (7 días)',
+        label: 'Período de gracia (7 días)',
         cls: 'bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/30'
       };
     }
     if (est === 'vencido' || (est === 'activo' && isExpiredDate)) {
       return {
-        label: 'Comercial: Vencido',
+        label: 'Vencida',
         cls: 'bg-[#EF4444]/15 text-[#EF4444] border-[#EF4444]/30'
       };
     }
     if (est === 'suspendido') {
       return {
-        label: 'Comercial: Suspendido',
+        label: 'Suspendida',
         cls: 'bg-[#EF4444]/15 text-[#EF4444] border-[#EF4444]/30'
       };
     }
     if (est === 'cancelado') {
       return {
-        label: 'Comercial: Cancelado',
+        label: 'Cancelada',
         cls: 'bg-[#94A3B8]/15 text-[#94A3B8] border-[#94A3B8]/30'
       };
     }
     return {
-      label: 'Comercial: No contratado / Pendiente',
+      label: 'Sin suscripción activa',
       cls: 'bg-[#94A3B8]/15 text-[#94A3B8] border-[#94A3B8]/30'
     };
   })();
@@ -1217,14 +1441,13 @@ export function App() {
   const registrationBadge = (() => {
     switch (deviceIdentity?.registrationStatus) {
       case 'registered':
-        return { label: 'Registrado en Firebase', cls: 'bg-[#10B981]/15 text-[#10B981]' };
       case 'paired':
-        return { label: 'Vinculado (E2EE)', cls: 'bg-[#00CFE8]/15 text-[#00CFE8]' };
+        return { label: 'Registrada y activa', cls: 'text-[#10B981]' };
       case 'revoked':
-        return { label: 'Dispositivo revocado', cls: 'bg-[#EF4444]/15 text-[#EF4444]' };
+        return { label: 'Acceso revocado', cls: 'text-[#EF4444]' };
       case 'pending_local':
       default:
-        return { label: 'Registro en nube pendiente', cls: 'bg-[#F59E0B]/15 text-[#F59E0B]' };
+        return { label: 'Registro pendiente', cls: 'text-[#F59E0B]' };
     }
   })();
 
@@ -1232,61 +1455,62 @@ export function App() {
     <div className="min-h-screen bg-[#0B1220] text-[#F1F5F9] flex flex-col font-sans selection:bg-[#00CFE8]/20">
       {/* Barra superior limpia */}
       <header className="h-14 border-b border-[#22324C] bg-[#111C2E]/90 backdrop-blur px-4 sm:px-6 flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-[#18263E] border border-[#22324C] flex items-center justify-center text-[#00CFE8]">
+        <button
+          type="button"
+          onClick={goHome}
+          className="flex items-center gap-3 text-left group cursor-pointer rounded-lg py-1 pr-2 hover:bg-[#18263E]/60 transition-colors"
+          title="Ir a la pantalla de bienvenida"
+          aria-label="VEL Inicio"
+        >
+          <div className="w-8 h-8 rounded-lg bg-[#18263E] border border-[#22324C] group-hover:border-[#00CFE8]/60 flex items-center justify-center text-[#00CFE8] transition-colors">
             <Shield className="w-4 h-4" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm tracking-wider text-white">VEL 0.1</span>
-              <span className="text-[10px] bg-[#00CFE8]/15 text-[#00CFE8] font-semibold px-2 py-0.5 rounded border border-[#00CFE8]/30">
-                Oficial
-              </span>
-            </div>
-            <p className="text-[11px] text-[#94A3B8] hidden sm:block">
+            <span className="font-bold text-sm tracking-wider text-white block leading-tight">VEL</span>
+            <p className="text-[11px] text-[#94A3B8] hidden sm:block leading-tight">
               Protección inteligente de tu información personal.
             </p>
           </div>
-        </div>
+        </button>
 
         {/* Pestañas de Vista */}
         <div className="flex items-center gap-2">
           <button
             onClick={() => setViewMode('PHONE_PREVIEW')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
               viewMode === 'PHONE_PREVIEW'
                 ? 'bg-[#00CFE8] text-[#0B1220] font-bold shadow-md'
                 : 'text-[#94A3B8] hover:text-white bg-[#18263E]'
             }`}
           >
             <Smartphone className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">App VEL (PWA)</span>
+            <span className="hidden sm:inline">App VEL</span>
             <span className="sm:hidden">VEL</span>
           </button>
 
           <button
             onClick={() => setViewMode('WEB_PORTAL')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
               viewMode === 'WEB_PORTAL'
                 ? 'bg-[#00CFE8] text-[#0B1220] font-bold shadow-md'
                 : 'text-[#94A3B8] hover:text-white bg-[#18263E]'
             }`}
           >
             <CreditCard className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Portal Web & Contratar</span>
+            <span className="hidden sm:inline">Contratar</span>
             <span className="sm:hidden">Contratar</span>
           </button>
 
           <button
             onClick={() => setViewMode('INSTALL_INFO')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
               viewMode === 'INSTALL_INFO'
                 ? 'bg-[#00CFE8] text-[#0B1220] font-bold shadow-md'
                 : 'text-[#94A3B8] hover:text-white bg-[#18263E]'
             }`}
           >
             <Info className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Instalar App (PWA)</span>
+            <span className="hidden sm:inline">Instalar</span>
             <span className="sm:hidden">Instalar</span>
           </button>
 
@@ -1345,208 +1569,629 @@ export function App() {
                 )}
 
                 {/* ============================================== */}
-                {/* 1. PANTALLA: PRIMER ACCESO Y ELECCIÓN DEL ROL */}
+                {/* 1. PANTALLA: BIENVENIDA PRINCIPAL VEL */}
                 {/* ============================================== */}
                 {!isLoadingIdentity && currentScreen === 'WELCOME' && (
-                  <div className="flex-1 px-5 py-3.5 flex flex-col justify-between space-y-3 overflow-hidden">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] bg-[#00CFE8]/15 text-[#00CFE8] font-bold px-2 py-0.5 rounded border border-[#00CFE8]/30">
-                        VEL 0.1
-                      </span>
-                    </div>
+                  <div className="flex-1 px-4 py-3.5 flex flex-col justify-between space-y-3 overflow-y-auto">
+                    <div className="space-y-3">
+                      {/* Encabezado: Logo Oficial + Bienvenida + Presentación */}
+                      <div className="flex flex-col items-center text-center space-y-2 pt-0.5">
+                        <div className="w-12 h-12 rounded-2xl bg-[#111C2E] border border-[#22324C] flex items-center justify-center shadow-lg">
+                          <svg className="w-8 h-8" viewBox="0 0 100 100" fill="none">
+                            <path d="M50 15L85 85H70L50 45L30 85H15L50 15Z" fill="#00CFE8" />
+                            <circle cx="50" cy="35" r="5" fill="#FFFFFF" />
+                          </svg>
+                        </div>
 
-                    {/* Logo Oficial VEL: V minimalista con línea luminosa y punto */}
-                    <div className="flex flex-col items-center text-center space-y-1.5 pt-0.5">
-                      <div className="w-14 h-14 rounded-2xl bg-[#111C2E] border border-[#22324C] flex items-center justify-center shadow-lg">
-                        <svg className="w-9 h-9" viewBox="0 0 100 100" fill="none">
-                          <path d="M50 15L85 85H70L50 45L30 85H15L50 15Z" fill="#00CFE8" />
-                          <circle cx="50" cy="35" r="5" fill="#FFFFFF" />
-                        </svg>
+                        <div className="space-y-1">
+                          <h1 className="text-lg font-extrabold tracking-tight text-white">
+                            BIENVENIDO A VEL
+                          </h1>
+                          <p className="text-[11px] text-[#E2E8F0] leading-relaxed px-1">
+                            VEL te permite proteger tu información personal mediante dos teléfonos con funciones complementarias: uno conserva tus datos resguardados y el otro los utiliza de forma segura cada día.
+                          </p>
+                        </div>
                       </div>
 
-                      <div className="space-y-0.5">
-                        <h1 className="text-xl font-extrabold tracking-tight text-white">
-                          Bienvenido a VEL
-                        </h1>
-                        <p className="text-[11px] text-[#94A3B8] max-w-[280px] mx-auto leading-relaxed">
-                          Protección inteligente de tu información personal.
+                      {/* Acceso rápido si este teléfono ya está configurado como VEL MÓVIL */}
+                      {deviceIdentity && deviceIdentity.role === 'TERMINAL' && (
+                        <div className="p-2.5 rounded-2xl bg-[#111C2E] border border-[#10B981]/35 space-y-2">
+                          <div className="flex items-center justify-center gap-1.5 text-[11px] text-[#CBD5E1]">
+                            <CheckCircle className="w-3.5 h-3.5 shrink-0 text-[#10B981]" />
+                            <span>Este teléfono ya está configurado como VEL MÓVIL.</span>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => navigateTo('TERMINAL_HOME')}
+                            className="w-full h-9 rounded-xl font-extrabold text-xs tracking-wide transition-all shadow cursor-pointer flex items-center justify-center gap-2 bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220]"
+                          >
+                            <Smartphone className="w-4 h-4" />
+                            <span>IR A MI PANEL VEL MÓVIL</span>
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Cómo funciona VEL */}
+                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2">
+                        <span className="text-[10px] font-extrabold tracking-wide text-[#00CFE8] block leading-snug">
+                          VEL FUNCIONA CON DOS TELÉFONOS Y SE DEBE DESCARGAR EN CADA TELÉFONO LA APP VEL.
+                        </span>
+
+                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#00CFE8]/25 space-y-0.5">
+                          <span className="text-[11px] font-bold text-white block">
+                            VEL CORE — Teléfono principal
+                          </span>
+                          <p className="text-[11px] text-[#CBD5E1] leading-snug">
+                            Es el dispositivo que conserva y protege la información personal cifrada localmente.
+                          </p>
+                        </div>
+
+                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#10B981]/25 space-y-0.5">
+                          <span className="text-[11px] font-bold text-white block">
+                            VEL MÓVIL — Teléfono de uso diario
+                          </span>
+                          <p className="text-[11px] text-[#CBD5E1] leading-snug">
+                            Permite utilizar la información protegida por CORE mediante una conexión segura, sin conservar copias personales.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Instrucciones antes de elegir el dispositivo */}
+                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-1.5">
+                        <span className="text-[10px] font-extrabold tracking-wide text-white block leading-snug">
+                          PRIMERO, IDENTIFICA QUÉ TELÉFONO VAS A CONFIGURAR
+                        </span>
+                        <ul className="space-y-1 text-[11px] text-[#CBD5E1] leading-snug list-disc list-inside">
+                          <li>
+                            Si este es tu teléfono principal, selecciona <strong className="text-[#00CFE8]">VEL CORE</strong> y realiza su configuración.
+                          </li>
+                          <li>
+                            Si este es tu teléfono de uso diario, selecciona <strong className="text-[#10B981]">VEL MÓVIL</strong> y sigue las instrucciones para vincularlo con el teléfono CORE.
+                          </li>
+                        </ul>
+                        <p className="text-[10px] text-[#94A3B8] leading-snug pt-0.5">
+                          Primero debe configurarse <strong className="text-white">VEL CORE</strong> en tu teléfono principal y posteriormente vincularse <strong className="text-white">VEL MÓVIL</strong> desde un segundo teléfono.
                         </p>
                       </div>
-                    </div>
 
-                    {/* Presentación de los dos roles */}
-                    <div className="w-full space-y-2">
-                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2">
-                        {/* Teléfono 1: VEL CORE */}
-                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#00CFE8]/30 flex items-start gap-2.5">
-                          <div className="w-7 h-7 rounded-lg bg-[#00CFE8]/10 text-[#00CFE8] flex items-center justify-center shrink-0 mt-0.5 border border-[#00CFE8]/30">
-                            <Shield className="w-3.5 h-3.5" />
-                          </div>
-                          <div>
-                            <h4 className="text-xs font-bold text-white">VEL CORE</h4>
-                            <p className="text-[10px] text-[#94A3B8] leading-tight">
-                              Dispositivo principal. Administra y protege tu información.
-                            </p>
-                          </div>
-                        </div>
-
-                        {/* Teléfono 2: VEL MÓVIL */}
-                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#10B981]/30 flex items-start gap-2.5">
-                          <div className="w-7 h-7 rounded-lg bg-[#10B981]/10 text-[#10B981] flex items-center justify-center shrink-0 mt-0.5 border border-[#10B981]/30">
-                            <Smartphone className="w-3.5 h-3.5" />
-                          </div>
-                          <div>
-                            <h4 className="text-xs font-bold text-white">VEL MÓVIL</h4>
-                            <p className="text-[10px] text-[#94A3B8] leading-tight">
-                              Dispositivo personal. Se conecta con tu VEL CORE.
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Elección obligatoria inicial */}
-                    <div className="space-y-2 pt-0.5">
-                      <span className="text-[11px] font-bold text-white block text-center">
-                        ¿Qué teléfono estás configurando?
-                      </span>
-
-                      <button
-                        onClick={() => handleStartDeviceSetup('CORE')}
-                        disabled={isSettingUpDevice}
-                        className="w-full h-11 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-extrabold text-xs tracking-wider transition-all shadow-md active:scale-[0.98] cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-60"
-                      >
-                        <Shield className="w-4 h-4" />
-                        <span>CONFIGURAR VEL CORE</span>
-                      </button>
-
-                      <button
-                        onClick={() => handleStartDeviceSetup('TERMINAL')}
-                        disabled={isSettingUpDevice}
-                        className="w-full h-11 rounded-xl bg-[#18263E] hover:bg-[#22324C] border border-[#00CFE8]/30 text-white font-bold text-xs tracking-wider transition-all active:scale-[0.98] cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-60"
-                      >
-                        <Smartphone className="w-4 h-4 text-[#00CFE8]" />
-                        <span>CONFIGURAR VEL MÓVIL</span>
-                      </button>
-
-                      <div className="pt-1 text-center">
-                        <a
-                          href={OFFICIAL_CONTRACT_URL}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-[11px] text-[#94A3B8] hover:text-[#00CFE8] transition-colors inline-flex items-center gap-1 cursor-pointer"
+                      {/* Dos opciones independientes de selección de dispositivo */}
+                      <div className="space-y-2.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (isActiveRegisteredCore) {
+                              navigateTo('CORE_HOME');
+                              return;
+                            }
+                            if (deviceIdentity?.role === 'CORE') {
+                              void handleStartDeviceSetup('CORE');
+                              return;
+                            }
+                            navigateTo('EXPLAIN_CORE');
+                          }}
+                          className="w-full p-3.5 rounded-2xl bg-[#111C2E] hover:bg-[#18263E] border-2 border-[#00CFE8]/50 hover:border-[#00CFE8] text-left transition-all active:scale-[0.99] cursor-pointer shadow-lg flex items-center justify-between gap-2"
                         >
-                          <FileText className="w-3 h-3" />
-                          <span>Consultar términos y condiciones</span>
-                          <ExternalLink className="w-2.5 h-2.5" />
-                        </a>
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <div className="w-9 h-9 rounded-xl bg-[#00CFE8]/15 border border-[#00CFE8]/40 flex items-center justify-center text-[#00CFE8] shrink-0">
+                              <Shield className="w-5 h-5" />
+                            </div>
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="text-xs font-extrabold tracking-wide text-white">
+                                  VEL CORE — CONFIGURAR TELÉFONO PRINCIPAL
+                                </span>
+                                {isActiveRegisteredCore && (
+                                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-[#00CFE8]/15 text-[#00CFE8] border border-[#00CFE8]/35">
+                                    Activo
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          <ChevronRight className="w-4 h-4 text-[#00CFE8] shrink-0" />
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => navigateTo('EXPLAIN_MOVIL')}
+                          className="w-full p-3.5 rounded-2xl bg-[#111C2E] hover:bg-[#18263E] border-2 border-[#10B981]/50 hover:border-[#10B981] text-left transition-all active:scale-[0.99] cursor-pointer shadow-lg flex items-center justify-between gap-2"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <div className="w-9 h-9 rounded-xl bg-[#10B981]/15 border border-[#10B981]/40 flex items-center justify-center text-[#10B981] shrink-0">
+                              <Smartphone className="w-5 h-5" />
+                            </div>
+                            <span className="text-xs font-extrabold tracking-wide text-white">
+                              VEL MÓVIL — CONFIGURAR TELÉFONO DE USO DIARIO
+                            </span>
+                          </div>
+                          <ChevronRight className="w-4 h-4 text-[#10B981] shrink-0" />
+                        </button>
                       </div>
+                    </div>
+
+                    {/* Pie: Enlace a términos y condiciones */}
+                    <div className="pt-1 pb-0.5 text-center">
+                      <a
+                        href={OFFICIAL_CONTRACT_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[11px] text-[#94A3B8] hover:text-[#00CFE8] transition-colors inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        <FileText className="w-3 h-3" />
+                        <span>Consultar términos y condiciones</span>
+                        <ExternalLink className="w-2.5 h-2.5" />
+                      </a>
                     </div>
                   </div>
                 )}
 
                 {/* ============================================== */}
-                {/* 1.1 CONFIGURACIÓN AUTOMÁTICA REAL: VEL CORE */}
+                {/* 1.0A PANTALLA EXPLICATIVA: SELECCIÓN VEL CORE */}
+                {/* ============================================== */}
+                {!isLoadingIdentity && currentScreen === 'EXPLAIN_CORE' && !isActiveRegisteredCore && (
+                  <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
+                    <div className="space-y-3">
+                      <button
+                        type="button"
+                        onClick={() => goBack('WELCOME')}
+                        className="h-9 px-3 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] inline-flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
+                      >
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>VOLVER</span>
+                      </button>
+
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-10 h-10 rounded-xl bg-[#00CFE8]/15 border border-[#00CFE8]/40 flex items-center justify-center text-[#00CFE8] shrink-0">
+                          <Shield className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <h2 className="text-base font-extrabold text-white leading-tight">
+                            Configuración de VEL CORE
+                          </h2>
+                          <p className="text-[11px] text-[#00CFE8] font-semibold">
+                            Primer teléfono · Custodio principal
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/30 space-y-2">
+                        <span className="text-xs font-bold text-white block">
+                          Función de VEL CORE
+                        </span>
+                        <p className="text-xs text-[#CBD5E1] leading-relaxed">
+                          Es tu teléfono principal. Conserva y protege tu información personal cifrada dentro del propio dispositivo y autoriza la conexión de tu teléfono móvil diario.
+                        </p>
+                      </div>
+
+                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2 text-xs">
+                        <span className="font-bold text-white block">
+                          Pasos de configuración
+                        </span>
+                        <ol className="list-decimal list-inside space-y-1.5 text-[11px] text-[#CBD5E1] leading-relaxed">
+                          <li>Crear el almacenamiento seguro y las claves privadas protegidas de este teléfono.</li>
+                          <li>Registrar la identidad técnica del teléfono principal sin subir datos personales.</li>
+                          <li>Acceder al panel VEL CORE, desde donde luego podrás vincular tu segundo teléfono.</li>
+                        </ol>
+                      </div>
+
+                      {deviceIdentity && deviceIdentity.role !== 'CORE' && (
+                        <div className="p-3.5 rounded-2xl bg-[#F59E0B]/10 border border-[#F59E0B]/40 space-y-1.5">
+                          <div className="flex items-center gap-1.5 text-[#F59E0B] font-bold text-xs">
+                            <AlertTriangle className="w-4 h-4 shrink-0" />
+                            <span>Este teléfono ya es VEL MÓVIL</span>
+                          </div>
+                          <p className="text-[11px] text-[#E2E8F0] leading-relaxed">
+                            Para configurar VEL CORE debes utilizar tu teléfono principal. No se modificó ni sobrescribió tu identidad actual de VEL MÓVIL.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="space-y-2 pt-1">
+                      {!deviceIdentity || deviceIdentity.role === 'CORE' ? (
+                        <button
+                          type="button"
+                          onClick={() => void handleStartDeviceSetup('CORE')}
+                          disabled={isSettingUpDevice}
+                          className="w-full h-11 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-extrabold text-xs tracking-wide transition-all shadow-md active:scale-[0.98] cursor-pointer flex items-center justify-center gap-2 px-3 disabled:opacity-60"
+                        >
+                          <Shield className="w-4 h-4 shrink-0" />
+                          <span>CONTINUAR CON CONFIGURACIÓN CORE</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => navigateTo('TERMINAL_HOME')}
+                          className="w-full h-11 rounded-xl bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-extrabold text-xs cursor-pointer flex items-center justify-center gap-2"
+                        >
+                          <Smartphone className="w-4 h-4 shrink-0" />
+                          <span>IR A MI PANEL VEL MÓVIL</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* ============================================== */}
+                {/* 1.0B PANTALLA EXPLICATIVA: SELECCIÓN VEL MÓVIL */}
+                {/* ============================================== */}
+                {!isLoadingIdentity && currentScreen === 'EXPLAIN_MOVIL' && (
+                  <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
+                    <div className="space-y-3">
+                      <button
+                        type="button"
+                        onClick={() => goBack('WELCOME')}
+                        className="h-9 px-3 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] inline-flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
+                      >
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>VOLVER</span>
+                      </button>
+
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-10 h-10 rounded-xl bg-[#10B981]/15 border border-[#10B981]/40 flex items-center justify-center text-[#10B981] shrink-0">
+                          <Smartphone className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <h2 className="text-base font-extrabold text-white leading-tight">
+                            Configuración de VEL MÓVIL
+                          </h2>
+                          <p className="text-[11px] text-[#10B981] font-semibold">
+                            Segundo teléfono · Uso diario
+                          </p>
+                        </div>
+                      </div>
+
+                      {deviceIdentity?.role === 'CORE' && (
+                        <div className="p-3.5 rounded-2xl bg-[#F59E0B]/15 border-2 border-[#F59E0B]/60 space-y-2">
+                          <div className="flex items-center gap-1.5 text-[#F59E0B] font-extrabold text-xs">
+                            <AlertTriangle className="w-4 h-4 shrink-0" />
+                            <span>Debes utilizar otro teléfono</span>
+                          </div>
+                          <p className="text-[11px] text-[#F1F5F9] leading-relaxed">
+                            Este dispositivo ya está configurado como <strong>VEL CORE</strong>. Para configurar <strong>VEL MÓVIL</strong> debes abrir VEL en un segundo teléfono diferente.
+                          </p>
+                          <p className="text-[11px] text-[#CBD5E1] leading-snug">
+                            No se cambió tu rol ni se modificó tu identidad VEL CORE.
+                          </p>
+
+                          <div className="pt-1 space-y-1.5">
+                            <div className="p-2 rounded-lg bg-[#0B1220] border border-[#22324C] text-[10px] font-mono text-[#00CFE8] break-all select-all">
+                              {publicVelUrl || 'Dirección no disponible'}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void handleCopyPublicVelUrl()}
+                              className="w-full h-8 rounded-lg bg-[#18263E] hover:bg-[#22324C] border border-[#00CFE8]/40 text-[#00CFE8] font-bold text-[11px] flex items-center justify-center gap-1.5 cursor-pointer"
+                            >
+                              <Copy className="w-3 h-3" />
+                              <span>COPIAR DIRECCIÓN PARA EL OTRO TELÉFONO</span>
+                            </button>
+                            {publicUrlCopyStatus === 'copied' && (
+                              <p className="text-[10px] font-semibold text-[#10B981] text-center">
+                                ✓ Dirección copiada al portapapeles
+                              </p>
+                            )}
+                            {publicUrlCopyStatus === 'error' && (
+                              <p className="text-[10px] text-[#F59E0B] text-center">
+                                No se pudo copiar automáticamente; copia manualmente la dirección mostrada.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#10B981]/30 space-y-2">
+                        <span className="text-xs font-bold text-white block">
+                          Importante: segundo teléfono independiente
+                        </span>
+                        <p className="text-xs text-[#CBD5E1] leading-relaxed">
+                          VEL MÓVIL debe configurarse en un teléfono distinto del que tiene VEL CORE. Te permite utilizar la información protegida por CORE sin guardar copias personales en este teléfono.
+                        </p>
+                      </div>
+
+                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2 text-xs">
+                        <span className="font-bold text-white block">
+                          Pasos en este segundo teléfono
+                        </span>
+                        <ol className="list-decimal list-inside space-y-1.5 text-[11px] text-[#CBD5E1] leading-relaxed">
+                          <li>Generar la identidad técnica independiente de este teléfono móvil.</li>
+                          <li>Ingresar en el panel VEL MÓVIL el código temporal de 8 caracteres generado en VEL CORE.</li>
+                          <li>Confirmar cara a cara en ambos teléfonos el código de seguridad SAS de 6 dígitos.</li>
+                        </ol>
+                      </div>
+
+                      {deviceIdentity?.role === 'TERMINAL' && (
+                        <div className="p-3 rounded-xl bg-[#10B981]/10 border border-[#10B981]/30 text-xs text-[#10B981] space-y-1">
+                          <strong>✓ VEL MÓVIL ya está configurado en este teléfono</strong>
+                          <p className="text-[11px] text-[#CBD5E1]">
+                            Tu identidad MÓVIL se conserva intacta.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="space-y-2 pt-1">
+                      {!deviceIdentity ? (
+                        <button
+                          type="button"
+                          onClick={() => void handleStartDeviceSetup('TERMINAL')}
+                          disabled={isSettingUpDevice}
+                          className="w-full h-11 rounded-xl bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-extrabold text-xs tracking-wide transition-all shadow-md active:scale-[0.98] cursor-pointer flex items-center justify-center gap-2 px-3 disabled:opacity-60"
+                        >
+                          <Smartphone className="w-4 h-4 shrink-0" />
+                          <span>CONTINUAR CON CONFIGURACIÓN MÓVIL</span>
+                        </button>
+                      ) : deviceIdentity.role === 'TERMINAL' ? (
+                        <button
+                          type="button"
+                          onClick={() => navigateTo('TERMINAL_HOME')}
+                          className="w-full h-11 rounded-xl bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-extrabold text-xs cursor-pointer flex items-center justify-center gap-2"
+                        >
+                          <Smartphone className="w-4 h-4 shrink-0" />
+                          <span>IR A MI PANEL VEL MÓVIL</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => goBack('WELCOME')}
+                          className="w-full h-10 rounded-xl bg-[#18263E] hover:bg-[#22324C] border border-[#22324C] text-white font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <ArrowLeft className="w-3.5 h-3.5" />
+                          <span>VOLVER AL INICIO</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* ============================================== */}
+                {/* 1.0C PANTALLA: GUÍA PARA SEGUNDO TELÉFONO DESDE CORE */}
+                {/* ============================================== */}
+                {!isLoadingIdentity &&
+                  currentScreen === 'SECOND_PHONE_GUIDE' &&
+                  deviceIdentity?.role === 'CORE' && (
+                    <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
+                      <div className="space-y-3">
+                        <button
+                          type="button"
+                          onClick={() => goBack('CORE_HOME')}
+                          className="h-9 px-3 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] inline-flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
+                        >
+                          <ArrowLeft className="w-3.5 h-3.5" />
+                          <span>VOLVER</span>
+                        </button>
+
+                        <div className="space-y-1">
+                          <h2 className="text-base font-extrabold text-white">
+                            Configurar VEL MÓVIL en otro teléfono
+                          </h2>
+                          <p className="text-xs text-[#CBD5E1] leading-relaxed">
+                            VEL CORE ya está configurado en este teléfono. Para utilizar VEL MÓVIL necesitas un segundo teléfono. Instala VEL en ese dispositivo, abre la aplicación desde su ícono y sigue la guía de configuración.
+                          </p>
+                        </div>
+
+                        <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5">
+                          <span className="text-[11px] font-bold text-white block">
+                            Dirección oficial para abrir en tu segundo teléfono
+                          </span>
+
+                          <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] text-[11px] font-mono text-[#00CFE8] break-all select-all">
+                            {publicVelUrl || 'Dirección no disponible'}
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyPublicVelUrl()}
+                            className="w-full h-10 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-extrabold text-xs flex items-center justify-center gap-2 cursor-pointer shadow"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>COPIAR DIRECCIÓN DE VEL</span>
+                          </button>
+
+                          {publicUrlCopyStatus === 'copied' && (
+                            <p className="text-[11px] font-semibold text-[#10B981] text-center">
+                              ✓ Dirección copiada al portapapeles
+                            </p>
+                          )}
+
+                          {publicUrlCopyStatus === 'error' && (
+                            <p className="text-[11px] text-[#F59E0B] leading-snug text-center">
+                              No se pudo copiar automáticamente al portapapeles. Selecciona y copia manualmente la dirección mostrada arriba.
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#10B981]/30 space-y-1.5 text-[11px] text-[#CBD5E1]">
+                          <span className="font-bold text-[#10B981] block">
+                            Pasos en el segundo teléfono:
+                          </span>
+                          <ol className="list-decimal list-inside space-y-1 leading-snug text-[#94A3B8]">
+                            <li>Abre esa dirección en el navegador de tu segundo teléfono.</li>
+                            <li>Instala VEL en su pantalla de inicio y ábrela desde su ícono.</li>
+                            <li>Toca <strong className="text-white">VEL MÓVIL</strong> y luego <strong className="text-white">CONTINUAR CON CONFIGURACIÓN MÓVIL</strong>.</li>
+                            <li>Cuando esté listo, regresa aquí a VEL CORE para iniciar la vinculación.</li>
+                          </ol>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => navigateTo('PAIRING_CORE')}
+                          className="w-full h-9 rounded-xl bg-[#0B1220] hover:bg-[#18263E] border border-[#00CFE8]/40 text-[#00CFE8] font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>Ir a vincular cuando el móvil esté listo</span>
+                        </button>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => goBack('CORE_HOME')}
+                        className="w-full h-10 rounded-xl bg-[#18263E] hover:bg-[#22324C] text-white font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>VOLVER</span>
+                      </button>
+                    </div>
+                  )}
+
+                {/* ============================================== */}
+                {/* 1.1 CONFIGURACIÓN: VEL CORE */}
                 {/* ============================================== */}
                 {!isLoadingIdentity && currentScreen === 'SETUP_CORE' && (
                   <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
                     <div className="space-y-3">
-                      <div className="space-y-0.5">
-                        <h2 className="text-base font-bold text-white">Configuración de VEL CORE</h2>
-                        <p className="text-xs text-[#94A3B8]">
-                          Identidad técnica única, claves Web Crypto protegidas y registro en Firebase.
-                        </p>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={() => goBack('WELCOME')}
+                        className="h-9 px-3 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] inline-flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
+                      >
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>VOLVER</span>
+                      </button>
 
-                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5">
-                        {setupSteps.map((s, idx) => (
-                          <div key={s.step} className="space-y-0.5">
-                            <div
-                              className={`flex items-center gap-2 font-bold text-xs ${
-                                s.status === 'done'
-                                  ? 'text-[#10B981]'
-                                  : s.status === 'error'
-                                  ? 'text-[#F59E0B]'
-                                  : s.status === 'in_progress'
-                                  ? 'text-[#00CFE8]'
-                                  : 'text-[#94A3B8]'
-                              }`}
-                            >
-                              {s.status === 'in_progress' ? (
-                                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-                              ) : s.status === 'error' ? (
-                                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                              ) : (
-                                <CheckCircle className="w-3.5 h-3.5 shrink-0" />
-                              )}
-                              <span>Paso {idx + 1}:</span>
-                            </div>
-                            <p className="text-[10px] text-[#94A3B8] leading-snug pl-5">{s.detail}</p>
-                          </div>
-                        ))}
-
-                        {deviceIdentity && (
-                          <div className="pt-2 mt-1 border-t border-[#22324C] space-y-1 font-mono text-[10px]">
-                            <div className="flex justify-between text-[#94A3B8]">
-                              <span>ID asignado:</span>
-                              <strong className="text-white">{deviceIdentity.deviceId}</strong>
-                            </div>
-                            <div className="flex justify-between text-[#94A3B8]">
-                              <span>Huella SHA-256:</span>
-                              <span className="text-[#00CFE8]">{deviceIdentity.fingerprint.slice(0, 17)}...</span>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-
-                      {!isSettingUpDevice && deviceIdentity?.registrationStatus === 'registered' && (
-                        <div className="p-3 rounded-xl bg-[#10B981]/10 border border-[#10B981]/30 text-xs text-[#10B981] space-y-1">
-                          <strong>✓ Identidad registrada en Firebase/Firestore</strong>
-                          <p className="text-[10px] text-white/90">
-                            Este dispositivo quedó persistido como VEL CORE con claves privadas no exportables en almacenamiento local.
-                          </p>
-                        </div>
-                      )}
-
-                      {!isSettingUpDevice && setupError && (
-                        <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-xs text-[#F59E0B] space-y-2">
-                          <p className="text-[10px] leading-snug">
-                            <strong>Registro remoto pendiente:</strong> {setupError}
-                          </p>
-                          {requiresExternalConfig && (
-                            <p className="text-[10px] text-white/80 leading-snug">
-                              Las claves locales ya quedaron protegidas en IndexedDB. Cuando Firebase Anonymous Auth y el servidor estén listos, pulsa reintentar sin perder tu ID.
+                      {deviceIdentity && deviceIdentity.role !== 'CORE' ? (
+                        <div className="space-y-3">
+                          <div className="space-y-1">
+                            <h2 className="text-base font-bold text-white">Este teléfono ya es VEL MÓVIL</h2>
+                            <p className="text-xs text-[#94A3B8] leading-relaxed">
+                              Tu configuración actual de VEL MÓVIL se conserva intacta y no fue modificada.
                             </p>
-                          )}
-                          <button
-                            type="button"
-                            onClick={handleRetryServerRegistration}
-                            disabled={isRetryingSync}
-                            className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
-                          >
-                            {isRetryingSync ? 'Reintentando registro...' : 'Reintentar registro en Firestore'}
-                          </button>
+                          </div>
+
+                          <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#10B981]/30 space-y-2 text-xs text-[#94A3B8] leading-relaxed">
+                            <p>
+                              Para usar <strong className="text-white">VEL CORE</strong>, abre VEL en tu teléfono principal, selecciona{' '}
+                              <strong className="text-[#00CFE8]">VEL CORE</strong> y luego{' '}
+                              <strong className="text-[#00CFE8]">CONTINUAR CON CONFIGURACIÓN CORE</strong>.
+                            </p>
+                            <p>
+                              Si realmente deseas cambiar la función de este teléfono, puedes hacerlo desde tu panel usando la opción de cambio controlado de rol.
+                            </p>
+                          </div>
                         </div>
+                      ) : (
+                        <>
+                          <div className="space-y-0.5">
+                            <h2 className="text-base font-bold text-white">Configuración de VEL CORE</h2>
+                            <p className="text-xs text-[#94A3B8]">
+                              Preparando este dispositivo como teléfono principal de protección.
+                            </p>
+                          </div>
+
+                          <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5">
+                            {setupSteps.map((s) => {
+                              const friendly = formatFriendlyStepLabel(s.step, s.status);
+                              return (
+                                <div key={s.step} className="space-y-0.5">
+                                  <div
+                                    className={`flex items-center gap-2 font-bold text-xs ${
+                                      s.status === 'done'
+                                        ? 'text-[#10B981]'
+                                        : s.status === 'error'
+                                        ? 'text-[#F59E0B]'
+                                        : s.status === 'in_progress'
+                                        ? 'text-[#00CFE8]'
+                                        : 'text-[#94A3B8]'
+                                    }`}
+                                  >
+                                    {s.status === 'in_progress' ? (
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                                    ) : s.status === 'error' ? (
+                                      <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                                    ) : (
+                                      <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                                    )}
+                                    <span>{friendly.title}</span>
+                                  </div>
+                                  <p className="text-[11px] text-[#94A3B8] leading-snug pl-5">{friendly.detail}</p>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          {!isSettingUpDevice && deviceIdentity?.registrationStatus !== 'pending_local' && deviceIdentity && (
+                            <div className="p-3 rounded-xl bg-[#10B981]/10 border border-[#10B981]/30 text-xs text-[#10B981] space-y-1">
+                              <strong>✓ VEL CORE listo para usar</strong>
+                              <p className="text-[11px] text-white/90">
+                                La protección local quedó guardada en este teléfono de forma segura.
+                              </p>
+                            </div>
+                          )}
+
+                          {!isSettingUpDevice && setupError && (
+                            <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-xs text-[#F59E0B] space-y-2">
+                              <p className="text-[11px] leading-snug">
+                                <strong>Registro en la nube pendiente:</strong> Tus claves locales siguen protegidas. Cuando recuperes conexión estable puedes reintentar.
+                              </p>
+                              <button
+                                type="button"
+                                onClick={handleRetryServerRegistration}
+                                disabled={isRetryingSync}
+                                className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                              >
+                                {isRetryingSync ? 'Reintentando...' : 'Reintentar registro'}
+                              </button>
+                            </div>
+                          )}
+
+                          {deviceIdentity && (
+                            <div className="rounded-xl bg-[#0B1220] border border-[#22324C] overflow-hidden">
+                              <button
+                                type="button"
+                                onClick={() => setShowSetupAdvancedTech((prev) => !prev)}
+                                className="w-full px-3 py-2 flex items-center justify-between text-[11px] font-semibold text-[#94A3B8] hover:text-white cursor-pointer"
+                              >
+                                <span>Información técnica avanzada</span>
+                                {showSetupAdvancedTech ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                              </button>
+                              {showSetupAdvancedTech && (
+                                <div className="px-3 pb-2.5 pt-1 border-t border-[#22324C] space-y-1 font-mono text-[10px] text-[#94A3B8]">
+                                  <div className="flex justify-between gap-2">
+                                    <span>ID asignado:</span>
+                                    <strong className="text-white truncate">{deviceIdentity.deviceId}</strong>
+                                  </div>
+                                  <div className="flex justify-between gap-2">
+                                    <span>Huella SHA-256:</span>
+                                    <span className="text-[#00CFE8]">{deviceIdentity.fingerprint.slice(0, 17)}...</span>
+                                  </div>
+                                  <div className="flex justify-between gap-2">
+                                    <span>Estado técnico:</span>
+                                    <span className="text-white">{deviceIdentity.registrationStatus}</span>
+                                  </div>
+                                  {setupError && (
+                                    <p className="text-[10px] text-[#F59E0B] pt-1 font-sans">{setupError}</p>
+                                  )}
+                                  {requiresExternalConfig && (
+                                    <p className="text-[10px] text-[#94A3B8] font-sans">
+                                      Requiere configuración de autenticación y backend activa.
+                                    </p>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
 
                     <div className="space-y-2">
-                      <button
-                        type="button"
-                        disabled={isSettingUpDevice || !deviceIdentity}
-                        onClick={() => setCurrentScreen('CORE_HOME')}
-                        className="w-full h-11 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-extrabold text-xs transition-all shadow cursor-pointer disabled:opacity-50"
-                      >
-                        {isSettingUpDevice ? 'CONFIGURANDO IDENTIDAD...' : 'ACCEDER AL PANEL DE VEL CORE'}
-                      </button>
-
-                      {!deviceIdentity && !isSettingUpDevice && (
+                      {deviceIdentity && deviceIdentity.role !== 'CORE' ? (
                         <button
                           type="button"
-                          onClick={() => setCurrentScreen('WELCOME')}
-                          className="w-full h-9 rounded-xl bg-[#18263E] text-white font-bold text-xs cursor-pointer"
+                          onClick={() => navigateTo('TERMINAL_HOME')}
+                          className="w-full h-11 rounded-xl bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-extrabold text-xs transition-all shadow cursor-pointer"
                         >
-                          Volver
+                          IR A MI PANEL VEL MÓVIL
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={isSettingUpDevice || !deviceIdentity}
+                          onClick={() => navigateTo('CORE_HOME')}
+                          className="w-full h-11 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-extrabold text-xs transition-all shadow cursor-pointer disabled:opacity-50"
+                        >
+                          {isSettingUpDevice ? 'CONFIGURANDO VEL CORE...' : 'ACCEDER AL PANEL DE VEL CORE'}
                         </button>
                       )}
                     </div>
@@ -1554,190 +2199,173 @@ export function App() {
                 )}
 
                 {/* ============================================== */}
-                {/* 1.2 CONFIGURACIÓN AUTOMÁTICA REAL: VEL MÓVIL */}
+                {/* 1.2 CONFIGURACIÓN: VEL MÓVIL */}
                 {/* ============================================== */}
                 {!isLoadingIdentity && currentScreen === 'SETUP_MOVIL' && (
                   <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
                     <div className="space-y-3">
-                      <div className="space-y-0.5">
-                        <h2 className="text-base font-bold text-white">Configuración de VEL MÓVIL</h2>
-                        <p className="text-xs text-[#94A3B8]">
-                          Terminal personal sin custodia de datos y con identidad criptográfica propia.
-                        </p>
-                      </div>
-
-                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5">
-                        {setupSteps.map((s, idx) => (
-                          <div key={s.step} className="space-y-0.5">
-                            <div
-                              className={`flex items-center gap-2 font-bold text-xs ${
-                                s.status === 'done'
-                                  ? 'text-[#10B981]'
-                                  : s.status === 'error'
-                                  ? 'text-[#F59E0B]'
-                                  : s.status === 'in_progress'
-                                  ? 'text-[#00CFE8]'
-                                  : 'text-[#94A3B8]'
-                              }`}
-                            >
-                              {s.status === 'in_progress' ? (
-                                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-                              ) : s.status === 'error' ? (
-                                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                              ) : (
-                                <CheckCircle className="w-3.5 h-3.5 shrink-0" />
-                              )}
-                              <span>Paso {idx + 1}:</span>
-                            </div>
-                            <p className="text-[10px] text-[#94A3B8] leading-snug pl-5">{s.detail}</p>
-                          </div>
-                        ))}
-
-                        {deviceIdentity && (
-                          <div className="pt-2 mt-1 border-t border-[#22324C] space-y-1 font-mono text-[10px]">
-                            <div className="flex justify-between text-[#94A3B8]">
-                              <span>ID asignado:</span>
-                              <strong className="text-white">{deviceIdentity.deviceId}</strong>
-                            </div>
-                            <div className="flex justify-between text-[#94A3B8]">
-                              <span>Huella SHA-256:</span>
-                              <span className="text-[#10B981]">{deviceIdentity.fingerprint.slice(0, 17)}...</span>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-
-                      {!isSettingUpDevice && setupError && (
-                        <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-xs text-[#F59E0B] space-y-2">
-                          <p className="text-[10px] leading-snug">
-                            <strong>Registro remoto pendiente:</strong> {setupError}
-                          </p>
-                          <button
-                            type="button"
-                            onClick={handleRetryServerRegistration}
-                            disabled={isRetryingSync}
-                            className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
-                          >
-                            {isRetryingSync ? 'Reintentando registro...' : 'Reintentar registro en Firestore'}
-                          </button>
-                        </div>
-                      )}
-
-                      <div className="p-3 rounded-xl bg-[#0B1220] border border-[#22324C] text-[10px] text-[#94A3B8] space-y-1">
-                        <strong className="text-white">Privacidad garantizada:</strong>
-                        <p>No se guardan conversaciones, contactos ni documentos personales en este terminal.</p>
-                      </div>
-                    </div>
-
-                    <button
-                      type="button"
-                      disabled={isSettingUpDevice || !deviceIdentity}
-                      onClick={() => setCurrentScreen('TERMINAL_HOME')}
-                      className="w-full h-11 rounded-xl bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-extrabold text-xs cursor-pointer disabled:opacity-50"
-                    >
-                      {isSettingUpDevice ? 'CONFIGURANDO TERMINAL...' : 'IR AL PANEL DE VEL MÓVIL'}
-                    </button>
-                  </div>
-                )}
-
-                {/* ============================================== */}
-                {/* 2. PANTALLA: SELECCIÓN EXPLÍCITA DE ROL */}
-                {/* ============================================== */}
-                {!isLoadingIdentity && currentScreen === 'ROLE_SELECTION' && (
-                  <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
-                    <div className="space-y-2">
                       <button
-                        onClick={() => setCurrentScreen('WELCOME')}
-                        className="h-9 px-3 -ml-2 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
+                        type="button"
+                        onClick={() => goBack('WELCOME')}
+                        className="h-9 px-3 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] inline-flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
                       >
-                        <ArrowLeft className="w-4 h-4" />
-                        <span>← Volver</span>
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>VOLVER</span>
                       </button>
 
-                      <div className="space-y-0.5">
-                        <h2 className="text-base font-bold text-white">¿Qué teléfono estás configurando?</h2>
-                        <p className="text-xs text-[#94A3B8]">Selecciona la función que desempeñará este dispositivo:</p>
-                      </div>
-                    </div>
-
-                    <div className="space-y-3 flex-1 flex flex-col justify-center">
-                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/30 space-y-2.5">
-                        <div className="flex items-center gap-2.5">
-                          <div className="w-8 h-8 rounded-lg bg-[#00CFE8]/10 text-[#00CFE8] flex items-center justify-center border border-[#00CFE8]/30">
-                            <Shield className="w-4 h-4" />
+                      {deviceIdentity && deviceIdentity.role === 'CORE' ? (
+                        <div className="space-y-3">
+                          <div className="space-y-1">
+                            <h2 className="text-base font-bold text-white">Este teléfono ya es VEL CORE</h2>
+                            <p className="text-xs text-[#94A3B8] leading-relaxed">
+                              Tu identidad principal y tu bóveda local siguen intactas y protegidas en este navegador.
+                            </p>
                           </div>
-                          <div>
-                            <h3 className="font-bold text-xs text-white">VEL CORE</h3>
-                            <p className="text-[10px] text-[#00CFE8]">Dispositivo principal</p>
-                          </div>
-                        </div>
 
-                        <ul className="text-[11px] text-[#94A3B8] space-y-1 list-disc list-inside">
-                          <li>Guarda las claves y los datos bajo su responsabilidad.</li>
-                          <li>Administra y autoriza al teléfono MÓVIL.</li>
-                        </ul>
-
-                        <button
-                          onClick={() => handleStartDeviceSetup('CORE')}
-                          disabled={isSettingUpDevice}
-                          className="w-full h-10 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-xs transition-all shadow cursor-pointer"
-                        >
-                          CONFIGURAR COMO VEL CORE
-                        </button>
-                      </div>
-
-                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#10B981]/30 space-y-2.5">
-                        <div className="flex items-center gap-2.5">
-                          <div className="w-8 h-8 rounded-lg bg-[#10B981]/10 text-[#10B981] flex items-center justify-center border border-[#10B981]/30">
-                            <Smartphone className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <h3 className="font-bold text-xs text-white">VEL MÓVIL</h3>
-                            <p className="text-[10px] text-[#10B981]">Dispositivo de uso diario</p>
+                          <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/30 space-y-2 text-xs text-[#94A3B8] leading-relaxed">
+                            <p>
+                              <strong className="text-white">VEL MÓVIL</strong> se configura en tu segundo teléfono (el de uso diario) abriendo VEL, seleccionando{' '}
+                              <strong className="text-[#10B981]">VEL MÓVIL</strong> y luego{' '}
+                              <strong className="text-[#10B981]">CONTINUAR CON CONFIGURACIÓN MÓVIL</strong>.
+                            </p>
+                            <p>
+                              Si deseas sustituir tu teléfono móvil anterior o vincular uno nuevo, hazlo desde tu panel de VEL CORE.
+                            </p>
                           </div>
                         </div>
+                      ) : (
+                        <>
+                          <div className="space-y-0.5">
+                            <h2 className="text-base font-bold text-white">Configuración de VEL MÓVIL</h2>
+                            <p className="text-xs text-[#94A3B8]">
+                              Preparando este teléfono para conectarse de forma segura con tu VEL CORE.
+                            </p>
+                          </div>
 
-                        <ul className="text-[11px] text-[#94A3B8] space-y-1 list-disc list-inside">
-                          <li>Se conecta con VEL CORE.</li>
-                          <li>Permite acceder a las funciones autorizadas.</li>
-                        </ul>
+                          <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5">
+                            {setupSteps.map((s) => {
+                              const friendly = formatFriendlyStepLabel(s.step, s.status);
+                              return (
+                                <div key={s.step} className="space-y-0.5">
+                                  <div
+                                    className={`flex items-center gap-2 font-bold text-xs ${
+                                      s.status === 'done'
+                                        ? 'text-[#10B981]'
+                                        : s.status === 'error'
+                                        ? 'text-[#F59E0B]'
+                                        : s.status === 'in_progress'
+                                        ? 'text-[#00CFE8]'
+                                        : 'text-[#94A3B8]'
+                                    }`}
+                                  >
+                                    {s.status === 'in_progress' ? (
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                                    ) : s.status === 'error' ? (
+                                      <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                                    ) : (
+                                      <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                                    )}
+                                    <span>{friendly.title}</span>
+                                  </div>
+                                  <p className="text-[11px] text-[#94A3B8] leading-snug pl-5">{friendly.detail}</p>
+                                </div>
+                              );
+                            })}
+                          </div>
 
-                        <button
-                          onClick={() => handleStartDeviceSetup('TERMINAL')}
-                          disabled={isSettingUpDevice}
-                          className="w-full h-10 rounded-xl bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-bold text-xs transition-all shadow cursor-pointer"
-                        >
-                          CONFIGURAR COMO VEL MÓVIL
-                        </button>
-                      </div>
+                          {!isSettingUpDevice && setupError && (
+                            <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-xs text-[#F59E0B] space-y-2">
+                              <p className="text-[11px] leading-snug">
+                                <strong>Registro en la nube pendiente:</strong> Tu identificación local sigue lista. Puedes reintentar cuando haya conexión.
+                              </p>
+                              <button
+                                type="button"
+                                onClick={handleRetryServerRegistration}
+                                disabled={isRetryingSync}
+                                className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                              >
+                                {isRetryingSync ? 'Reintentando...' : 'Reintentar registro'}
+                              </button>
+                            </div>
+                          )}
+
+                          <div className="p-3 rounded-xl bg-[#0B1220] border border-[#22324C] text-[11px] text-[#94A3B8] space-y-1">
+                            <strong className="text-white block">Privacidad garantizada</strong>
+                            <p>No se guardan conversaciones, contactos ni documentos personales en este teléfono móvil.</p>
+                          </div>
+
+                          {deviceIdentity && (
+                            <div className="rounded-xl bg-[#0B1220] border border-[#22324C] overflow-hidden">
+                              <button
+                                type="button"
+                                onClick={() => setShowSetupAdvancedTech((prev) => !prev)}
+                                className="w-full px-3 py-2 flex items-center justify-between text-[11px] font-semibold text-[#94A3B8] hover:text-white cursor-pointer"
+                              >
+                                <span>Información técnica avanzada</span>
+                                {showSetupAdvancedTech ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                              </button>
+                              {showSetupAdvancedTech && (
+                                <div className="px-3 pb-2.5 pt-1 border-t border-[#22324C] space-y-1 font-mono text-[10px] text-[#94A3B8]">
+                                  <div className="flex justify-between gap-2">
+                                    <span>ID asignado:</span>
+                                    <strong className="text-white truncate">{deviceIdentity.deviceId}</strong>
+                                  </div>
+                                  <div className="flex justify-between gap-2">
+                                    <span>Huella SHA-256:</span>
+                                    <span className="text-[#10B981]">{deviceIdentity.fingerprint.slice(0, 17)}...</span>
+                                  </div>
+                                  <div className="flex justify-between gap-2">
+                                    <span>Estado técnico:</span>
+                                    <span className="text-white">{deviceIdentity.registrationStatus}</span>
+                                  </div>
+                                  {setupError && (
+                                    <p className="text-[10px] text-[#F59E0B] pt-1 font-sans">{setupError}</p>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </>
+                      )}
                     </div>
+
+                    {deviceIdentity && deviceIdentity.role === 'CORE' ? (
+                      <button
+                        type="button"
+                        onClick={() => navigateTo('CORE_HOME')}
+                        className="w-full h-11 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-extrabold text-xs cursor-pointer"
+                      >
+                        IR A MI PANEL VEL CORE
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={isSettingUpDevice || !deviceIdentity}
+                        onClick={() => navigateTo('TERMINAL_HOME')}
+                        className="w-full h-11 rounded-xl bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-extrabold text-xs cursor-pointer disabled:opacity-50"
+                      >
+                        {isSettingUpDevice ? 'CONFIGURANDO VEL MÓVIL...' : 'IR AL PANEL DE VEL MÓVIL'}
+                      </button>
+                    )}
                   </div>
                 )}
 
                 {/* ============================================== */}
-                {/* 3. PANTALLA: PANEL PRINCIPAL VEL CORE */}
+                {/* 2. PANTALLA: PANEL PRINCIPAL VEL CORE */}
                 {/* ============================================== */}
                 {!isLoadingIdentity && currentScreen === 'CORE_HOME' && deviceIdentity && (
                   <div className="flex-1 px-5 py-3.5 flex flex-col justify-between space-y-3 overflow-y-auto">
                     <div className="space-y-3">
-                      {/* Cabecera */}
-                      <div className="flex items-center justify-between pb-2 border-b border-[#22324C]">
-                        <div className="flex items-center gap-2">
-                          <div className="w-7 h-7 rounded-lg bg-[#00CFE8]/10 border border-[#00CFE8]/30 flex items-center justify-center text-[#00CFE8]">
-                            <Shield className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <div className="flex items-center gap-1.5">
-                              <h2 className="font-bold text-sm text-white leading-none">VEL CORE</h2>
-                              <span className="text-[9px] bg-[#00CFE8]/15 text-[#00CFE8] font-bold px-1.5 py-0.5 rounded">
-                                Principal
-                              </span>
-                            </div>
-                            <p className="text-[10px] text-[#94A3B8] font-mono mt-0.5">
-                              ID: {deviceIdentity.deviceId}
-                            </p>
-                          </div>
-                        </div>
+                      {/* Navegación superior visible + Cabecera */}
+                      <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#22324C]">
+                        <button
+                          type="button"
+                          onClick={goHome}
+                          className="h-8 px-2.5 rounded-lg bg-[#111C2E] hover:bg-[#18263E] border border-[#22324C] text-[#00CFE8] hover:text-white text-[11px] font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <ArrowLeft className="w-3.5 h-3.5" />
+                          <span>VOLVER AL INICIO</span>
+                        </button>
 
                         <button
                           type="button"
@@ -1746,228 +2374,135 @@ export function App() {
                             setRoleChangeError(null);
                             setShowRoleChangeModal(true);
                           }}
-                          className="p-1.5 rounded-lg bg-[#111C2E] border border-[#22324C] text-[#94A3B8] hover:text-white cursor-pointer"
-                          title="Cambio controlado de rol"
+                          className="h-8 px-2.5 rounded-lg bg-[#111C2E] border border-[#22324C] text-[#94A3B8] hover:text-white text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                          title="Cambiar la función de este teléfono"
                         >
-                          <RefreshCw className="w-3.5 h-3.5" />
+                          <RefreshCw className="w-3 h-3" />
+                          <span>Cambiar rol</span>
                         </button>
                       </div>
 
-                      {/* Estado técnico real en Firebase / IndexedDB */}
-                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[11px] font-bold text-white flex items-center gap-1.5">
-                            <Key className="w-3.5 h-3.5 text-[#00CFE8]" />
-                            <span>Identidad Técnica</span>
-                          </span>
-                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${registrationBadge.cls}`}>
-                            {registrationBadge.label}
-                          </span>
+                      <div className="flex items-center gap-2.5">
+                        <button
+                          type="button"
+                          onClick={goHome}
+                          className="w-9 h-9 rounded-xl bg-[#00CFE8]/10 border border-[#00CFE8]/30 hover:border-[#00CFE8] flex items-center justify-center text-[#00CFE8] cursor-pointer transition-colors shrink-0"
+                          title="Ir a la pantalla de bienvenida"
+                          aria-label="Ir al inicio"
+                        >
+                          <Shield className="w-4 h-4" />
+                        </button>
+                        <div>
+                          <h2 className="font-bold text-sm text-white leading-tight">Panel VEL CORE</h2>
+                          <p className="text-[11px] text-[#94A3B8]">
+                            Teléfono principal · Protección y administración
+                          </p>
                         </div>
-
-                        <div className="p-2 rounded-xl bg-[#0B1220] border border-[#22324C] space-y-1 text-[10px] font-mono">
-                          <div className="flex justify-between text-[#94A3B8]">
-                            <span>Huella pública:</span>
-                            <span className="text-[#00CFE8]">{deviceIdentity.fingerprint.slice(0, 17)}...</span>
-                          </div>
-                          <div className="flex justify-between text-[#94A3B8]">
-                            <span>Claves privadas:</span>
-                            <span className="text-[#10B981]">No exportables (Web Crypto)</span>
-                          </div>
-                          {deviceIdentity.firebaseAuthUid && (
-                            <div className="flex justify-between text-[#94A3B8]">
-                              <span>Sesión Firebase UID:</span>
-                              <span className="text-white">{deviceIdentity.firebaseAuthUid.slice(0, 10)}...</span>
-                            </div>
-                          )}
-                        </div>
-
-                        {deviceIdentity.registrationStatus === 'pending_local' && (
-                          <div className="space-y-1.5 pt-0.5">
-                            {setupError && (
-                              <p className="text-[10px] text-[#F59E0B] leading-snug">{setupError}</p>
-                            )}
-                            <button
-                              type="button"
-                              onClick={handleRetryServerRegistration}
-                              disabled={isRetryingSync}
-                              className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
-                            >
-                              {isRetryingSync ? 'Registrando...' : 'Completar registro en Firestore'}
-                            </button>
-                          </div>
-                        )}
                       </div>
 
-                      {/* Sección: Teléfono móvil vinculado y estado real del Relay */}
-                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5">
-                        <div className="flex items-center justify-between gap-1">
-                          <span className="text-xs font-bold text-white uppercase tracking-wider">
-                            Mi teléfono móvil
-                          </span>
-                          {(() => {
-                            const rb = formatRelayBadge(relaySnapshot.connectionState, relaySnapshot.peerOnline);
-                            return (
-                              <span className={`text-[9px] font-bold px-2 py-0.5 rounded border ${rb.cls}`}>
-                                {rb.label}
+                      {/* 4 estados claros e independientes */}
+                      {(() => {
+                        const relaySimple = formatRelaySimpleStatus(relaySnapshot.connectionState);
+                        const isConfirmedPaired = Boolean(
+                          deviceIdentity.pairedPeerDeviceId &&
+                            (deviceIdentity.registrationStatus === 'paired' ||
+                              relaySnapshot.connectionState === 'LINKED')
+                        );
+                        const phoneStatusText = isConfirmedPaired
+                          ? relaySnapshot.peerOnline
+                            ? 'Emparejado · En línea'
+                            : 'Emparejado · Desconectado'
+                          : 'Pendiente de emparejamiento';
+                        const phoneStatusCls = isConfirmedPaired
+                          ? relaySnapshot.peerOnline
+                            ? 'text-[#10B981]'
+                            : 'text-[#00CFE8]'
+                          : 'text-[#F59E0B]';
+
+                        return (
+                          <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5 text-xs">
+                            <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#22324C]/70">
+                              <span className="text-[#94A3B8] text-[11px]">Identidad CORE</span>
+                              <span className={`font-bold text-[11px] ${registrationBadge.cls}`}>
+                                {registrationBadge.label}
                               </span>
-                            );
-                          })()}
-                        </div>
+                            </div>
 
-                        {!relayConfig.loading && !relayConfig.configured && (
-                          <div className="p-2 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-[10px] text-[#F59E0B] leading-snug space-y-1">
-                            <strong>Relay externo pendiente de configuración:</strong>
-                            <p className="text-white/80">
-                              Define <code className="text-[#00CFE8]">VEL_RELAY_WSS_URL</code> en Netlify con la URL real <code className="text-[#00CFE8]">wss://...</code> de tu servidor Relay desplegado.
-                            </p>
-                          </div>
-                        )}
-
-                        {relaySnapshot.lastError && (
-                          <div className="p-2 rounded-xl bg-[#EF4444]/10 border border-[#EF4444]/30 text-[10px] text-[#FCA5A5] flex items-center justify-between gap-2">
-                            <span className="leading-snug">{relaySnapshot.lastError}</span>
-                            <button
-                              type="button"
-                              onClick={handleReconnectRelay}
-                              className="px-2 py-1 rounded bg-[#18263E] text-[#00CFE8] font-bold shrink-0 cursor-pointer"
-                            >
-                              Reintentar
-                            </button>
-                          </div>
-                        )}
-
-                        {deviceIdentity.pairedPeerDeviceId ? (
-                          <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] space-y-1">
-                            <div className="flex items-center justify-between">
+                            <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#22324C]/70">
+                              <span className="text-[#94A3B8] text-[11px]">Servicio de comunicación</span>
                               <div className="flex items-center gap-2">
-                                <Smartphone className="w-4 h-4 text-[#00CFE8]" />
-                                <span className="text-xs font-bold text-white font-mono">
-                                  {deviceIdentity.pairedPeerDeviceId}
+                                <span className={`font-bold text-[11px] ${relaySimple.cls}`}>
+                                  {relaySimple.label}
                                 </span>
+                                {(relaySnapshot.connectionState === 'DISCONNECTED' ||
+                                  relaySnapshot.connectionState === 'ERROR') &&
+                                  deviceIdentity.registrationStatus !== 'revoked' && (
+                                    <button
+                                      type="button"
+                                      onClick={handleReconnectRelay}
+                                      className="text-[10px] font-bold text-[#00CFE8] hover:underline cursor-pointer"
+                                    >
+                                      Reconectar
+                                    </button>
+                                  )}
                               </div>
-                              <span
-                                className={`w-2 h-2 rounded-full ${
-                                  relaySnapshot.peerOnline ? 'bg-[#10B981]' : 'bg-[#94A3B8]'
-                                }`}
-                                title={relaySnapshot.peerOnline ? 'En línea' : 'Desconectado'}
-                              />
                             </div>
-                            <p className="text-[10px] text-[#94A3B8]">
-                              {relaySnapshot.connectionState === 'LINKED'
-                                ? 'Clave de sesión AES-256-GCM derivada en memoria (no exportable).'
-                                : 'Vínculo autorizado en Firestore.'}
-                            </p>
-                          </div>
-                        ) : (
-                          <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] text-center space-y-1">
-                            <p className="text-[11px] text-white font-bold">
-                              Ningún VEL MÓVIL vinculado todavía
-                            </p>
-                            <p className="text-[10px] text-[#94A3B8] leading-snug">
-                              Genera una invitación temporal de 5 minutos en Vincular para emparejar con código SAS de 6 dígitos.
-                            </p>
-                          </div>
-                        )}
 
-                        {/* Canal cifrado E2EE en tiempo real (cuando está vinculado) */}
-                        {deviceIdentity.pairedPeerDeviceId && (
-                          <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#00CFE8]/25 space-y-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[10px] font-bold text-[#00CFE8] uppercase tracking-wider flex items-center gap-1">
-                                <Lock className="w-3 h-3" />
-                                <span>Canal Cifrado E2EE</span>
+                            <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#22324C]/70">
+                              <span className="text-[#94A3B8] text-[11px]">Teléfono MÓVIL</span>
+                              <span className={`font-bold text-[11px] ${phoneStatusCls}`}>
+                                {phoneStatusText}
                               </span>
-                              {relaySnapshot.connectionState !== 'LINKED' && (
-                                <button
-                                  type="button"
-                                  onClick={handleReconnectRelay}
-                                  className="text-[9px] text-[#00CFE8] hover:underline cursor-pointer"
-                                >
-                                  Reconectar
-                                </button>
-                              )}
                             </div>
 
-                            <form onSubmit={(e) => void handleSendE2eeVerification(e)} className="flex gap-1.5">
-                              <input
-                                type="text"
-                                value={e2eeMessageInput}
-                                onChange={(e) => setE2eeMessageInput(e.target.value)}
-                                placeholder="Texto de prueba cifrado E2EE..."
-                                className="flex-1 h-8 px-2.5 rounded-lg bg-[#111C2E] border border-[#22324C] text-[10px] text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
-                              />
-                              <button
-                                type="submit"
-                                disabled={isSendingE2ee || relaySnapshot.connectionState !== 'LINKED'}
-                                className="h-8 px-2.5 rounded-lg bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-[10px] flex items-center gap-1 cursor-pointer disabled:opacity-45 shrink-0"
-                              >
-                                <Send className="w-3 h-3" />
-                                <span>Probar</span>
-                              </button>
-                            </form>
-
-                            {e2eeNotice && (
-                              <p className="text-[9px] text-[#F59E0B] leading-tight">{e2eeNotice}</p>
-                            )}
-
-                            {relaySnapshot.operations.slice(0, 2).map((op) => {
-                              const st = formatOpStatusLabel(op.status);
-                              return (
-                                <div
-                                  key={op.operationId}
-                                  className="p-1.5 rounded-lg bg-[#111C2E] border border-[#22324C] text-[9px] space-y-0.5"
-                                >
-                                  <div className="flex items-center justify-between gap-1">
-                                    <span className="text-white truncate">{op.previewLabel}</span>
-                                    <span className={`font-bold shrink-0 ${st.cls}`}>{st.text}</span>
-                                  </div>
-                                  <div className="flex items-center justify-between text-[#94A3B8]">
-                                    <span className="truncate">{op.statusDetail}</span>
-                                    {(op.status === 'FAILED' || op.status === 'UNKNOWN') &&
-                                      op.direction === 'OUTGOING' && (
-                                        <button
-                                          type="button"
-                                          onClick={() => void handleSendE2eeVerification(undefined, op.previewLabel)}
-                                          className="text-[#00CFE8] font-bold ml-1 shrink-0 cursor-pointer"
-                                        >
-                                          Reintentar
-                                        </button>
-                                      )}
-                                  </div>
-                                </div>
-                              );
-                            })}
-
-                            {relaySnapshot.receivedMessages.length > 0 && (
-                              <div className="p-1.5 rounded-lg bg-[#10B981]/10 border border-[#10B981]/25 text-[9px] space-y-1">
-                                <span className="text-[#10B981] font-bold block">
-                                  Último recibido y descifrado en memoria:
-                                </span>
-                                <span className="text-white break-words block">
-                                  {relaySnapshot.receivedMessages[0].text}
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[#94A3B8] text-[11px]">Suscripción comercial</span>
+                              <div className="flex items-center gap-2">
+                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${commercialStatusBadge.cls}`}>
+                                  {commercialStatusBadge.label}
                                 </span>
                                 <button
                                   type="button"
-                                  onClick={() =>
-                                    void handleArchiveIncomingMessageInCore(
-                                      relaySnapshot.receivedMessages[0].text,
-                                      relaySnapshot.receivedMessages[0].operationId
-                                    )
-                                  }
-                                  className="px-2 py-0.5 rounded bg-[#00CFE8]/15 border border-[#00CFE8]/40 text-[#00CFE8] font-bold cursor-pointer"
+                                  onClick={() => setViewMode('WEB_PORTAL')}
+                                  className="text-[10px] font-bold text-[#00CFE8] hover:underline cursor-pointer"
                                 >
-                                  Guardar cifrado en bóveda CORE
+                                  Gestionar
+                                </button>
+                              </div>
+                            </div>
+
+                            {deviceIdentity.registrationStatus === 'pending_local' && (
+                              <div className="pt-1">
+                                <button
+                                  type="button"
+                                  onClick={handleRetryServerRegistration}
+                                  disabled={isRetryingSync}
+                                  className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                                >
+                                  {isRetryingSync ? 'Registrando...' : 'Completar registro en la nube'}
                                 </button>
                               </div>
                             )}
                           </div>
+                        );
+                      })()}
+
+                      {/* Gestión de teléfono móvil */}
+                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5">
+                        <span className="text-xs font-bold text-white block">
+                          Gestión de tu teléfono móvil
+                        </span>
+
+                        {!deviceIdentity.pairedPeerDeviceId && (
+                          <p className="text-[11px] text-[#94A3B8] leading-snug">
+                            Genera un código de invitación temporal de 8 caracteres en «Vincular» y escríbelo en tu VEL MÓVIL; luego ambos mostrarán un código SAS de 6 dígitos para confirmar cara a cara.
+                          </p>
                         )}
 
-                        {/* Botones de acción de VEL CORE */}
-                        <div className="grid grid-cols-2 gap-2 pt-1">
+                        <div className="grid grid-cols-2 gap-2">
                           <button
-                            onClick={() => setCurrentScreen('PAIRING_CORE')}
+                            type="button"
+                            onClick={() => navigateTo('PAIRING_CORE')}
                             className="h-9 rounded-xl bg-[#18263E] hover:bg-[#22324C] border border-[#22324C] text-[#00CFE8] font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
                           >
                             <Plus className="w-3.5 h-3.5" />
@@ -1975,7 +2510,8 @@ export function App() {
                           </button>
 
                           <button
-                            onClick={() => setCurrentScreen('DEVICE_MANAGEMENT')}
+                            type="button"
+                            onClick={() => navigateTo('DEVICE_MANAGEMENT')}
                             className="h-9 rounded-xl bg-[#18263E] hover:bg-[#22324C] border border-[#22324C] text-white font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
                           >
                             <Smartphone className="w-3.5 h-3.5 text-[#00CFE8]" />
@@ -1984,59 +2520,181 @@ export function App() {
                         </div>
 
                         <button
-                          onClick={() => setCurrentScreen('REPLACE_PHONE')}
-                          className="w-full h-9 rounded-xl bg-[#111C2E] hover:bg-[#18263E] border border-[#00CFE8]/40 text-[#00CFE8] font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                          type="button"
+                          onClick={() => navigateTo('REPLACE_PHONE')}
+                          className="w-full h-9 rounded-xl bg-[#0B1220] hover:bg-[#18263E] border border-[#00CFE8]/40 text-[#00CFE8] font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
                         >
                           <RefreshCw className="w-3.5 h-3.5" />
                           <span>REEMPLAZAR TELÉFONO MÓVIL</span>
                         </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPublicUrlCopyStatus('idle');
+                            navigateTo('SECOND_PHONE_GUIDE');
+                          }}
+                          className="w-full h-9 rounded-xl bg-[#0B1220] hover:bg-[#18263E] border border-[#10B981]/40 text-[#10B981] font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                        >
+                          <Smartphone className="w-3.5 h-3.5 shrink-0" />
+                          <span>CONFIGURAR VEL MÓVIL EN OTRO TELÉFONO</span>
+                        </button>
                       </div>
 
-                      {/* Estado Comercial independiente del Estado Técnico */}
-                      <div className="p-2.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-1">
-                        <div className="flex items-center justify-between gap-1">
-                          <span className="text-[10px] font-bold text-white">Estado comercial</span>
-                          <span className={`text-[9px] font-bold px-2 py-0.5 rounded border ${commercialStatusBadge.cls}`}>
-                            {commercialStatusBadge.label}
-                          </span>
+                      {/* Comunicación protegida con el teléfono móvil (cuando está vinculado) */}
+                      {deviceIdentity.pairedPeerDeviceId && (
+                        <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/25 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                              <Lock className="w-3.5 h-3.5 text-[#00CFE8]" />
+                              <span>Comunicación con tu teléfono móvil</span>
+                            </span>
+                            {relaySnapshot.connectionState !== 'LINKED' && (
+                              <button
+                                type="button"
+                                onClick={handleReconnectRelay}
+                                className="text-[10px] text-[#00CFE8] hover:underline cursor-pointer font-semibold"
+                              >
+                                Reconectar
+                              </button>
+                            )}
+                          </div>
+
+                          <form
+                            onSubmit={(e) => void handleSendE2eeVerification(e)}
+                            noValidate
+                            className="flex gap-1.5"
+                          >
+                            <input
+                              type="text"
+                              value={e2eeMessageInput}
+                              onChange={(e) => {
+                                setE2eeMessageInput(e.target.value);
+                                if (e2eeNotice) setE2eeNotice(null);
+                              }}
+                              placeholder="Escribe un mensaje protegido (obligatorio)..."
+                              className="flex-1 h-8 px-2.5 rounded-lg bg-[#0B1220] border border-[#22324C] text-[11px] text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
+                            />
+                            <button
+                              type="submit"
+                              disabled={isSendingE2ee}
+                              className="h-8 px-3 rounded-lg bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-[11px] flex items-center gap-1 cursor-pointer disabled:opacity-45 shrink-0"
+                            >
+                              <Send className="w-3 h-3" />
+                              <span>Enviar</span>
+                            </button>
+                          </form>
+
+                          {e2eeNotice && (
+                            <p className="text-[10px] text-[#F59E0B] leading-tight">{e2eeNotice}</p>
+                          )}
+
+                          {relaySnapshot.operations.slice(0, 2).map((op) => {
+                            const st = formatOpStatusLabel(op.status);
+                            return (
+                              <div
+                                key={op.operationId}
+                                className="p-2 rounded-lg bg-[#0B1220] border border-[#22324C] text-[10px] space-y-0.5"
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-white truncate">{op.previewLabel}</span>
+                                  <span className={`font-bold shrink-0 ${st.cls}`}>{st.text}</span>
+                                </div>
+                                <div className="flex items-center justify-between text-[#94A3B8]">
+                                  <span className="truncate">{op.statusDetail}</span>
+                                  {(op.status === 'FAILED' || op.status === 'UNKNOWN') &&
+                                    op.direction === 'OUTGOING' && (
+                                      <button
+                                        type="button"
+                                        onClick={() => void handleSendE2eeVerification(undefined, op.previewLabel)}
+                                        className="text-[#00CFE8] font-bold ml-1 shrink-0 cursor-pointer"
+                                      >
+                                        Reintentar
+                                      </button>
+                                    )}
+                                </div>
+                              </div>
+                            );
+                          })}
+
+                          {relaySnapshot.receivedMessages.length > 0 && (
+                            <div className="p-2 rounded-lg bg-[#10B981]/10 border border-[#10B981]/25 text-[10px] space-y-1.5">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-[#10B981] font-bold">
+                                  Mensajes recientes en memoria ({relaySnapshot.receivedMessages.length}):
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => relayClientRef.current?.clearReceivedMessages()}
+                                  className="text-[10px] text-[#00CFE8] hover:underline font-semibold cursor-pointer shrink-0"
+                                >
+                                  Limpiar
+                                </button>
+                              </div>
+                              <div className="max-h-32 overflow-y-auto space-y-1.5">
+                                {relaySnapshot.receivedMessages.map((msg) => (
+                                  <div
+                                    key={msg.operationId}
+                                    className="p-1.5 rounded bg-[#0B1220] border border-[#22324C] space-y-1"
+                                  >
+                                    <span className="text-white break-words block">{msg.text}</span>
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="text-[9px] text-[#94A3B8]">
+                                        {msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : ''}
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          void handleArchiveIncomingMessageInCore(msg.text, msg.operationId)
+                                        }
+                                        className="px-2 py-0.5 rounded bg-[#00CFE8]/15 border border-[#00CFE8]/40 text-[#00CFE8] font-bold cursor-pointer"
+                                      >
+                                        Guardar en bóveda CORE
+                                      </button>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         </div>
-                        <p className="text-[9px] text-[#94A3B8] leading-snug">
-                          El estado comercial es independiente: una suspensión comercial nunca borra tus registros locales ni revoca tus dispositivos.
-                        </p>
-                      </div>
+                      )}
 
                       {/* Bóveda Local Cifrada (Custodia exclusiva de VEL CORE) */}
-                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/30 space-y-2">
+                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/30 space-y-2.5">
                         <div className="flex items-center justify-between">
-                          <span className="text-[11px] font-bold text-white flex items-center gap-1.5">
+                          <span className="text-xs font-bold text-white flex items-center gap-1.5">
                             <Database className="w-3.5 h-3.5 text-[#00CFE8]" />
                             <span>Bóveda Local Cifrada (CORE)</span>
                           </span>
-                          <span className="text-[9px] font-mono bg-[#00CFE8]/15 text-[#00CFE8] px-2 py-0.5 rounded font-bold">
+                          <span className="text-[10px] text-[#00CFE8] font-bold">
                             {coreVaultRecords.length} registro{coreVaultRecords.length === 1 ? '' : 's'}
                           </span>
                         </div>
 
-                        <form onSubmit={handleSaveCoreVaultNote} className="space-y-1.5">
+                        <form onSubmit={handleSaveCoreVaultNote} noValidate className="space-y-1.5">
                           <input
                             type="text"
                             value={vaultNoteTitle}
                             onChange={(e) => setVaultNoteTitle(e.target.value)}
-                            placeholder="Título del registro local..."
-                            className="w-full h-7 px-2.5 rounded-lg bg-[#0B1220] border border-[#22324C] text-[10px] text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
+                            placeholder="Título (opcional)"
+                            className="w-full h-8 px-2.5 rounded-lg bg-[#0B1220] border border-[#22324C] text-[11px] text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
                           />
                           <div className="flex gap-1.5">
                             <input
                               type="text"
                               value={vaultNoteBody}
-                              onChange={(e) => setVaultNoteBody(e.target.value)}
-                              placeholder="Dato personal (cifrado solo aquí)..."
-                              className="flex-1 h-7 px-2.5 rounded-lg bg-[#0B1220] border border-[#22324C] text-[10px] text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
+                              onChange={(e) => {
+                                setVaultNoteBody(e.target.value);
+                                if (vaultError) setVaultError(null);
+                              }}
+                              placeholder="Contenido a proteger (obligatorio)..."
+                              className="flex-1 h-8 px-2.5 rounded-lg bg-[#0B1220] border border-[#22324C] text-[11px] text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
                             />
                             <button
                               type="submit"
                               disabled={isSavingVaultNote}
-                              className="h-7 px-2.5 rounded-lg bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-[10px] cursor-pointer disabled:opacity-50 shrink-0"
+                              className="h-8 px-3 rounded-lg bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-50 shrink-0"
                             >
                               {isSavingVaultNote ? '...' : 'Guardar'}
                             </button>
@@ -2044,17 +2702,17 @@ export function App() {
                         </form>
 
                         {vaultError && (
-                          <p className="text-[9px] text-[#EF4444]">{vaultError}</p>
+                          <p className="text-[10px] text-[#EF4444] leading-snug">{vaultError}</p>
                         )}
 
                         {decryptedVaultNote && (
-                          <div className="p-2 rounded-xl bg-[#0B1220] border border-[#10B981]/40 text-[10px] space-y-1">
-                            <div className="flex items-center justify-between">
+                          <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#10B981]/40 text-[11px] space-y-1">
+                            <div className="flex items-center justify-between gap-2">
                               <strong className="text-[#10B981] truncate">{decryptedVaultNote.title}</strong>
                               <button
                                 type="button"
                                 onClick={() => setDecryptedVaultNote(null)}
-                                className="text-[9px] text-[#94A3B8] hover:text-white inline-flex items-center gap-0.5 cursor-pointer"
+                                className="text-[10px] text-[#94A3B8] hover:text-white inline-flex items-center gap-0.5 cursor-pointer shrink-0"
                               >
                                 <EyeOff className="w-3 h-3" />
                                 <span>Ocultar</span>
@@ -2066,17 +2724,19 @@ export function App() {
 
                         {coreVaultRecords.length > 0 && (
                           <div className="max-h-24 overflow-y-auto space-y-1">
-                            {coreVaultRecords.slice(0, 5).map((rec) => (
+                            {coreVaultRecords.slice(0, 5).map((rec, idx) => (
                               <div
                                 key={rec.id}
-                                className="p-1.5 rounded-lg bg-[#0B1220] border border-[#22324C] flex items-center justify-between gap-2 text-[9px]"
+                                className="p-1.5 rounded-lg bg-[#0B1220] border border-[#22324C] flex items-center justify-between gap-2 text-[10px]"
                               >
-                                <span className="font-mono text-[#94A3B8] truncate">{rec.id}</span>
-                                <div className="flex items-center gap-1.5 shrink-0">
+                                <span className="text-[#94A3B8] truncate">
+                                  Registro protegido #{coreVaultRecords.length - idx} · {new Date(rec.updatedAt).toLocaleDateString()}
+                                </span>
+                                <div className="flex items-center gap-2 shrink-0">
                                   <button
                                     type="button"
                                     onClick={() => void handleOpenCoreVaultNote(rec.id)}
-                                    className="text-[#00CFE8] hover:underline inline-flex items-center gap-0.5 cursor-pointer"
+                                    className="text-[#00CFE8] hover:underline inline-flex items-center gap-0.5 cursor-pointer font-semibold"
                                   >
                                     <Eye className="w-3 h-3" />
                                     <span>Ver</span>
@@ -2085,7 +2745,7 @@ export function App() {
                                     type="button"
                                     onClick={() => void handleDeleteCoreVaultNote(rec.id)}
                                     className="text-[#EF4444] hover:underline inline-flex items-center cursor-pointer"
-                                    title="Eliminar registro local"
+                                    title="Eliminar registro"
                                   >
                                     <Trash2 className="w-3 h-3" />
                                   </button>
@@ -2095,10 +2755,18 @@ export function App() {
                           </div>
                         )}
 
-                        <p className="text-[9px] text-[#94A3B8] leading-tight">
-                          Cifrado AES-256-GCM en IndexedDB (sin envío a Firebase, Netlify ni Relay). Si borras los datos del navegador CORE, no existe recuperación en la nube.
+                        <p className="text-[10px] text-[#94A3B8] leading-snug">
+                          Tu información se guarda protegida únicamente en este teléfono principal.
                         </p>
                       </div>
+
+                      {fileTransferService && (
+                        <CoreBinaryVaultPanel
+                          transferService={fileTransferService}
+                          incomingTransfers={fileTransferSnapshot.incoming}
+                          vaultRevision={coreBinaryVaultRevision}
+                        />
+                      )}
 
                       {/* SECCIÓN DESTACADA: EMERGENCIA Y REVOCACIÓN */}
                       <div className="p-3.5 rounded-2xl bg-gradient-to-br from-[#1A1A2E] to-[#161226] border border-[#EF4444]/40 space-y-2">
@@ -2126,6 +2794,59 @@ export function App() {
                           <span>EMERGENCIA Y REVOCACIÓN</span>
                         </button>
                       </div>
+
+                      {/* Apartado colapsable de información técnica avanzada */}
+                      <div className="rounded-xl bg-[#0B1220] border border-[#22324C] overflow-hidden">
+                        <button
+                          type="button"
+                          onClick={() => setShowCoreAdvancedTech((prev) => !prev)}
+                          className="w-full px-3 py-2 flex items-center justify-between text-[11px] font-semibold text-[#94A3B8] hover:text-white cursor-pointer"
+                        >
+                          <span>Información técnica avanzada</span>
+                          {showCoreAdvancedTech ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+                        {showCoreAdvancedTech && (
+                          <div className="px-3 pb-3 pt-1.5 border-t border-[#22324C] space-y-1 font-mono text-[10px] text-[#94A3B8]">
+                            <div className="flex justify-between gap-2">
+                              <span>ID dispositivo:</span>
+                              <span className="text-white truncate">{deviceIdentity.deviceId}</span>
+                            </div>
+                            <div className="flex justify-between gap-2">
+                              <span>Huella SHA-256:</span>
+                              <span className="text-[#00CFE8]">{deviceIdentity.fingerprint.slice(0, 17)}...</span>
+                            </div>
+                            <div className="flex justify-between gap-2">
+                              <span>Claves privadas:</span>
+                              <span className="text-[#10B981]">No exportables (Web Crypto)</span>
+                            </div>
+                            {deviceIdentity.firebaseAuthUid && (
+                              <div className="flex justify-between gap-2">
+                                <span>Firebase UID:</span>
+                                <span className="text-white">{deviceIdentity.firebaseAuthUid.slice(0, 12)}...</span>
+                              </div>
+                            )}
+                            {deviceIdentity.pairedPeerDeviceId && (
+                              <div className="flex justify-between gap-2">
+                                <span>MÓVIL vinculado:</span>
+                                <span className="text-white truncate">{deviceIdentity.pairedPeerDeviceId}</span>
+                              </div>
+                            )}
+                            {deviceIdentity.activeLinkId && (
+                              <div className="flex justify-between gap-2">
+                                <span>Vínculo ID:</span>
+                                <span className="text-white truncate">{deviceIdentity.activeLinkId}</span>
+                              </div>
+                            )}
+                            <p className="font-sans text-[10px] text-[#94A3B8] pt-1">
+                              Bóveda cifrada con AES-256-GCM en IndexedDB local. Estado comercial independiente del resguardo local.
+                            </p>
+                            {setupError && <p className="font-sans text-[10px] text-[#F59E0B]">{setupError}</p>}
+                            {relaySnapshot.lastError && (
+                              <p className="font-sans text-[10px] text-[#EF4444]">{relaySnapshot.lastError}</p>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     <div className="text-center pt-1 border-t border-[#22324C]">
@@ -2149,24 +2870,16 @@ export function App() {
                 {!isLoadingIdentity && currentScreen === 'TERMINAL_HOME' && deviceIdentity && (
                   <div className="flex-1 px-5 py-3.5 flex flex-col justify-between space-y-3 overflow-y-auto">
                     <div className="space-y-3">
-                      {/* Cabecera */}
-                      <div className="flex items-center justify-between pb-2 border-b border-[#22324C]">
-                        <div className="flex items-center gap-2">
-                          <div className="w-7 h-7 rounded-lg bg-[#10B981]/10 border border-[#10B981]/30 flex items-center justify-center text-[#10B981]">
-                            <Smartphone className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <div className="flex items-center gap-1.5">
-                              <h2 className="font-bold text-sm text-white leading-none">VEL MÓVIL</h2>
-                              <span className="text-[9px] bg-[#10B981]/15 text-[#10B981] font-bold px-1.5 py-0.5 rounded">
-                                Terminal
-                              </span>
-                            </div>
-                            <p className="text-[10px] text-[#94A3B8] font-mono mt-0.5">
-                              ID: {deviceIdentity.deviceId}
-                            </p>
-                          </div>
-                        </div>
+                      {/* Navegación superior visible */}
+                      <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#22324C]">
+                        <button
+                          type="button"
+                          onClick={goHome}
+                          className="h-8 px-2.5 rounded-lg bg-[#111C2E] hover:bg-[#18263E] border border-[#22324C] text-[#00CFE8] hover:text-white text-[11px] font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <ArrowLeft className="w-3.5 h-3.5" />
+                          <span>VOLVER AL INICIO</span>
+                        </button>
 
                         <button
                           type="button"
@@ -2175,100 +2888,148 @@ export function App() {
                             setRoleChangeError(null);
                             setShowRoleChangeModal(true);
                           }}
-                          className="p-1.5 rounded-lg bg-[#111C2E] border border-[#22324C] text-[#94A3B8] hover:text-white cursor-pointer"
-                          title="Cambio controlado de rol"
+                          className="h-8 px-2.5 rounded-lg bg-[#111C2E] border border-[#22324C] text-[#94A3B8] hover:text-white text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                          title="Cambiar la función de este teléfono"
                         >
-                          <RefreshCw className="w-3.5 h-3.5" />
+                          <RefreshCw className="w-3 h-3" />
+                          <span>Cambiar rol</span>
                         </button>
                       </div>
 
-                      {/* Estado real con VEL CORE */}
-                      <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2">
-                        <div className="flex items-center justify-between gap-1">
-                          <span className="text-xs font-bold text-white uppercase tracking-wider">
-                            Estado en red VEL
-                          </span>
-                          {(() => {
-                            const rb = formatRelayBadge(relaySnapshot.connectionState, relaySnapshot.peerOnline);
-                            return (
-                              <span className={`text-[9px] font-bold px-2 py-0.5 rounded border ${rb.cls}`}>
-                                {rb.label}
+                      <div className="flex items-center gap-2.5">
+                        <button
+                          type="button"
+                          onClick={goHome}
+                          className="w-9 h-9 rounded-xl bg-[#10B981]/10 border border-[#10B981]/30 hover:border-[#10B981] flex items-center justify-center text-[#10B981] cursor-pointer transition-colors shrink-0"
+                          title="Ir a la pantalla de bienvenida"
+                          aria-label="Ir al inicio"
+                        >
+                          <Smartphone className="w-4 h-4" />
+                        </button>
+                        <div>
+                          <h2 className="font-bold text-sm text-white leading-tight">Panel VEL MÓVIL</h2>
+                          <p className="text-[11px] text-[#94A3B8]">
+                            Teléfono de uso diario · Sin custodia de datos
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Estados claros y separados */}
+                      {(() => {
+                        const relaySimple = formatRelaySimpleStatus(relaySnapshot.connectionState);
+                        const isConfirmedPaired = Boolean(
+                          deviceIdentity.pairedPeerDeviceId &&
+                            (deviceIdentity.registrationStatus === 'paired' ||
+                              relaySnapshot.connectionState === 'LINKED')
+                        );
+                        const coreStatusText =
+                          deviceIdentity.registrationStatus === 'revoked'
+                            ? 'Acceso revocado por CORE'
+                            : isConfirmedPaired
+                            ? relaySnapshot.peerOnline
+                              ? 'Emparejado · En línea'
+                              : 'Emparejado · Desconectado'
+                            : 'Pendiente de emparejamiento';
+                        const coreStatusCls =
+                          deviceIdentity.registrationStatus === 'revoked'
+                            ? 'text-[#EF4444]'
+                            : isConfirmedPaired
+                            ? relaySnapshot.peerOnline
+                              ? 'text-[#10B981]'
+                              : 'text-[#00CFE8]'
+                            : 'text-[#F59E0B]';
+
+                        return (
+                          <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2.5 text-xs">
+                            <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#22324C]/70">
+                              <span className="text-[#94A3B8] text-[11px]">Identidad MÓVIL</span>
+                              <span className={`font-bold text-[11px] ${registrationBadge.cls}`}>
+                                {registrationBadge.label}
                               </span>
-                            );
-                          })()}
-                        </div>
-
-                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] flex items-center justify-between">
-                          <div className="flex items-center gap-2.5">
-                            <div className="w-8 h-8 rounded-lg bg-[#18263E] border border-[#22324C] flex items-center justify-center text-[#10B981]">
-                              <Shield className="w-4 h-4" />
                             </div>
-                            <div>
-                              <h4 className="text-xs font-bold text-white leading-none">VEL CORE asociado</h4>
-                              <p className="text-[10px] text-[#94A3B8] mt-0.5 font-mono">
-                                {deviceIdentity.pairedPeerDeviceId
-                                  ? `ID: ${deviceIdentity.pairedPeerDeviceId}`
-                                  : 'Aún no vinculado'}
-                              </p>
+
+                            <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#22324C]/70">
+                              <span className="text-[#94A3B8] text-[11px]">Servicio de comunicación</span>
+                              <div className="flex items-center gap-2">
+                                <span className={`font-bold text-[11px] ${relaySimple.cls}`}>
+                                  {relaySimple.label}
+                                </span>
+                                {(relaySnapshot.connectionState === 'DISCONNECTED' ||
+                                  relaySnapshot.connectionState === 'ERROR') &&
+                                  deviceIdentity.registrationStatus !== 'revoked' && (
+                                    <button
+                                      type="button"
+                                      onClick={handleReconnectRelay}
+                                      className="text-[10px] font-bold text-[#00CFE8] hover:underline cursor-pointer"
+                                    >
+                                      Reconectar
+                                    </button>
+                                  )}
+                              </div>
                             </div>
-                          </div>
-                          <span
-                            className={`w-2.5 h-2.5 rounded-full ${
-                              deviceIdentity.registrationStatus === 'revoked'
-                                ? 'bg-[#EF4444]'
-                                : relaySnapshot.connectionState === 'LINKED' && relaySnapshot.peerOnline
-                                ? 'bg-[#10B981]'
-                                : deviceIdentity.pairedPeerDeviceId
-                                ? 'bg-[#00CFE8]'
-                                : 'bg-[#F59E0B]'
-                            }`}
-                          ></span>
-                        </div>
 
-                        {!relayConfig.loading && !relayConfig.configured && (
-                          <div className="p-2 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-[10px] text-[#F59E0B] leading-snug">
-                            Relay externo pendiente de configuración (<code className="text-[#00CFE8]">VEL_RELAY_WSS_URL</code>).
-                          </div>
-                        )}
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[#94A3B8] text-[11px]">VEL CORE asociado</span>
+                              <span className={`font-bold text-[11px] ${coreStatusCls}`}>
+                                {coreStatusText}
+                              </span>
+                            </div>
 
-                        {deviceIdentity.registrationStatus === 'revoked' && (
-                          <div className="p-2.5 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/30 text-[#FCA5A5] text-[11px] leading-tight">
-                            {relaySnapshot.lastRevocationMessage ||
-                              'Acceso revocado permanentemente por VEL CORE para esta identidad técnica.'}
-                          </div>
-                        )}
+                            {deviceIdentity.registrationStatus === 'revoked' && (
+                              <div className="p-2.5 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/30 text-[#FCA5A5] text-[11px] leading-tight">
+                                {relaySnapshot.lastRevocationMessage ||
+                                  'Acceso revocado permanentemente por VEL CORE para este dispositivo.'}
+                              </div>
+                            )}
 
-                        {deviceIdentity.registrationStatus === 'pending_local' && (
-                          <div className="space-y-1.5">
+                            {deviceIdentity.registrationStatus === 'pending_local' && (
+                              <div className="pt-1">
+                                <button
+                                  type="button"
+                                  onClick={handleRetryServerRegistration}
+                                  disabled={isRetryingSync}
+                                  className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                                >
+                                  {isRetryingSync ? 'Registrando...' : 'Completar registro en la nube'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+
+                      {/* Emparejamiento desde VEL MÓVIL (visible tanto si falta registro remoto como si ya está registrado) */}
+                      {!deviceIdentity.pairedPeerDeviceId &&
+                        deviceIdentity.registrationStatus === 'pending_local' && (
+                          <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#F59E0B]/40 space-y-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2 text-[#F59E0B] text-xs font-bold">
+                                <Radio className="w-4 h-4" />
+                                <span>Vincular con VEL CORE</span>
+                              </div>
+                              <span className="text-[9px] font-bold px-2 py-0.5 rounded bg-[#F59E0B]/15 text-[#F59E0B] border border-[#F59E0B]/30">
+                                Registro pendiente
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-[#94A3B8] leading-snug">
+                              Para poder emparejar este teléfono con tu VEL CORE, primero debe completarse el registro remoto de esta identidad en la nube. Tus claves locales ya están protegidas.
+                            </p>
                             {setupError && (
-                              <p className="text-[10px] text-[#F59E0B] leading-snug">{setupError}</p>
+                              <p className="text-[10px] text-[#F59E0B] leading-snug bg-[#0B1220] p-2 rounded-lg border border-[#F59E0B]/25">
+                                {setupError}
+                              </p>
                             )}
                             <button
                               type="button"
                               onClick={handleRetryServerRegistration}
                               disabled={isRetryingSync}
-                              className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                              className="w-full h-9 rounded-xl bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-xs cursor-pointer disabled:opacity-60"
                             >
-                              {isRetryingSync ? 'Registrando...' : 'Completar registro en Firestore'}
+                              {isRetryingSync ? 'Registrando en la nube...' : 'Completar registro para vincular'}
                             </button>
                           </div>
                         )}
 
-                        {relaySnapshot.lastError && deviceIdentity.registrationStatus !== 'revoked' && (
-                          <div className="p-2 rounded-xl bg-[#EF4444]/10 border border-[#EF4444]/30 text-[10px] text-[#FCA5A5] flex items-center justify-between gap-2">
-                            <span>{relaySnapshot.lastError}</span>
-                            <button
-                              type="button"
-                              onClick={handleReconnectRelay}
-                              className="px-2 py-1 rounded bg-[#18263E] text-[#00CFE8] font-bold shrink-0 cursor-pointer"
-                            >
-                              Reconectar
-                            </button>
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Emparejamiento desde VEL MÓVIL (cuando aún no está vinculado) */}
                       {!deviceIdentity.pairedPeerDeviceId &&
                         deviceIdentity.registrationStatus === 'registered' && (
                           <div className="p-3.5 rounded-2xl bg-[#111C2E] border border-[#10B981]/30 space-y-2.5">
@@ -2277,23 +3038,37 @@ export function App() {
                               <span>Vincular con VEL CORE</span>
                             </div>
 
-                            {relaySnapshot.pairingSession?.stage === 'SAS_PENDING' ||
-                            relaySnapshot.pairingSession?.stage === 'SAS_AWAITING_PEER' ? (
+                            {relaySnapshot.pairingSession?.stage === 'CLAIMING' ? (
+                              <div className="p-3.5 rounded-xl bg-[#0B1220] border border-[#00CFE8]/35 text-center space-y-2.5">
+                                <Loader2 className="w-5 h-5 text-[#00CFE8] animate-spin mx-auto" />
+                                <div className="space-y-1">
+                                  <p className="text-xs font-bold text-white">
+                                    Verificando código de invitación...
+                                  </p>
+                                  <p className="text-[11px] font-mono text-[#00CFE8] tracking-widest">
+                                    {relaySnapshot.pairingSession.code}
+                                  </p>
+                                  <p className="text-[11px] text-[#94A3B8] leading-snug">
+                                    Esperando confirmación de VEL CORE para mostrar el código SAS de 6 dígitos.
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => relayClientRef.current!.cancelPairing('CANCELLED_BY_TERMINAL')}
+                                  className="w-full h-8 rounded-lg border border-[#EF4444]/40 text-[#EF4444] text-[10px] font-bold cursor-pointer"
+                                >
+                                  Cancelar espera
+                                </button>
+                              </div>
+                            ) : relaySnapshot.pairingSession?.stage === 'SAS_PENDING' ||
+                              relaySnapshot.pairingSession?.stage === 'SAS_AWAITING_PEER' ? (
                               <div className="space-y-2.5">
                                 <div className="p-3 rounded-xl bg-[#0B1220] border border-[#10B981]/40 text-center space-y-1.5">
                                   <span className="text-[10px] font-bold text-[#10B981] uppercase tracking-wider block">
-                                    Verificación de Seguridad (SAS)
+                                    Paso 2 · Código SAS de 6 dígitos
                                   </span>
                                   <div className="text-2xl font-mono font-extrabold tracking-[0.22em] text-[#10B981] py-1">
                                     {relaySnapshot.pairingSession.sasCode || '---'}
-                                  </div>
-                                  <div className="text-[10px] text-[#94A3B8] font-mono space-y-0.5">
-                                    <p>CORE: {relaySnapshot.pairingSession.peerDeviceId}</p>
-                                    {relaySnapshot.pairingSession.peerFingerprint && (
-                                      <p className="text-[#00CFE8]">
-                                        Huella: {relaySnapshot.pairingSession.peerFingerprint.slice(0, 17)}...
-                                      </p>
-                                    )}
                                   </div>
                                 </div>
 
@@ -2308,7 +3083,7 @@ export function App() {
                                       ✓ Confirmado. Esperando a VEL CORE...
                                     </button>
                                     <p className="text-[10px] text-[#94A3B8] leading-snug text-center">
-                                      Ambos dispositivos deben confirmar para completar el emparejamiento cifrado.
+                                      Ambos teléfonos deben confirmar este código SAS de 6 dígitos para completar la vinculación.
                                     </p>
                                     <button
                                       type="button"
@@ -2320,8 +3095,8 @@ export function App() {
                                   </div>
                                 ) : (
                                   <div className="space-y-2">
-                                    <p className="text-[10px] text-[#94A3B8] leading-snug text-center">
-                                      Compara este código de seguridad con el que aparece en tu VEL CORE. Pulsa confirmar solo si coinciden visualmente.
+                                    <p className="text-[11px] text-[#94A3B8] leading-snug text-center">
+                                      Compara este código SAS de 6 dígitos (verificación cara a cara) con el que aparece en tu VEL CORE. Pulsa confirmar solo si coinciden.
                                     </p>
                                     <div className="grid grid-cols-2 gap-2">
                                       <button
@@ -2347,73 +3122,105 @@ export function App() {
                                     </div>
                                   </div>
                                 )}
+
+                                {relaySnapshot.lastError && (
+                                  <div className="p-2.5 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-[11px] text-[#FCA5A5] leading-snug flex items-start gap-1.5">
+                                    <AlertTriangle className="w-3.5 h-3.5 text-[#EF4444] shrink-0 mt-0.5" />
+                                    <span>{relaySnapshot.lastError}</span>
+                                  </div>
+                                )}
                               </div>
                             ) : (
-                              <form onSubmit={handleClaimPairingCode} className="space-y-2">
+                              <form onSubmit={handleClaimPairingCode} noValidate className="space-y-2">
+                                <p className="text-[11px] text-[#94A3B8] leading-snug">
+                                  Paso 1: ingresa el <strong className="text-white">código de invitación de 8 caracteres</strong> (formato <span className="font-mono text-white">XXXX-XXXX</span>) generado en «Vincular» de tu VEL CORE (obligatorio):
+                                </p>
                                 <p className="text-[10px] text-[#94A3B8] leading-snug">
-                                  Ingresa el código temporal de 8 caracteres generado en la pantalla Vincular de VEL CORE:
+                                  Luego ambos teléfonos mostrarán un código SAS distinto de 6 dígitos para confirmar cara a cara.
                                 </p>
                                 <input
                                   type="text"
                                   value={pairingCodeInput}
-                                  onChange={(e) => setPairingCodeInput(e.target.value.toUpperCase())}
+                                  onChange={(e) => {
+                                    setPairingCodeInput(e.target.value.toUpperCase());
+                                    if (pairingFormError) setPairingFormError(null);
+                                  }}
                                   placeholder="Ej: ABCD-2345"
                                   className="w-full h-9 px-3 rounded-xl bg-[#0B1220] border border-[#22324C] text-xs font-mono text-white text-center tracking-widest uppercase focus:outline-none focus:border-[#10B981]"
                                 />
+                                {(pairingFormError ||
+                                  relaySnapshot.lastError ||
+                                  relaySnapshot.pairingSession?.stage === 'EXPIRED') && (
+                                  <div className="p-2.5 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-[11px] text-[#FCA5A5] leading-snug flex items-start gap-1.5">
+                                    <AlertTriangle className="w-3.5 h-3.5 text-[#EF4444] shrink-0 mt-0.5" />
+                                    <span>
+                                      {pairingFormError ||
+                                        relaySnapshot.lastError ||
+                                        'El código de invitación de 8 caracteres expiró. Genera uno nuevo en tu VEL CORE.'}
+                                    </span>
+                                  </div>
+                                )}
                                 <button
                                   type="submit"
-                                  disabled={
-                                    isClaimingPairing ||
-                                    relaySnapshot.connectionState !== 'AUTHENTICATED' ||
-                                    !pairingCodeInput.trim()
-                                  }
+                                  disabled={isClaimingPairing}
                                   className="w-full h-9 rounded-xl bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-bold text-xs cursor-pointer disabled:opacity-45"
                                 >
-                                  {isClaimingPairing ? 'Enviando solicitud...' : 'Conectar con VEL CORE'}
+                                  {isClaimingPairing ? 'Enviando código...' : 'Conectar con VEL CORE'}
                                 </button>
                               </form>
                             )}
                           </div>
                         )}
 
-                      {/* Canal cifrado E2EE en VEL MÓVIL (cuando ya está vinculado) */}
+                      {/* Comunicación con VEL CORE (cuando ya está vinculado) */}
                       {deviceIdentity.pairedPeerDeviceId &&
                         deviceIdentity.registrationStatus === 'paired' && (
                           <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/25 space-y-2">
                             <div className="flex items-center justify-between">
-                              <span className="text-[10px] font-bold text-[#00CFE8] uppercase tracking-wider flex items-center gap-1">
-                                <Lock className="w-3 h-3" />
-                                <span>Canal Cifrado E2EE con CORE</span>
+                              <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                                <Lock className="w-3.5 h-3.5 text-[#00CFE8]" />
+                                <span>Comunicación con VEL CORE</span>
                               </span>
-                              <span className="text-[9px] text-[#94A3B8] font-mono">
-                                {relaySnapshot.peerOnline ? 'CORE en línea' : 'CORE desconectado'}
+                              <span className="text-[10px] text-[#94A3B8]">
+                                {relaySnapshot.peerOnline ? 'En línea' : 'Desconectado'}
                               </span>
                             </div>
 
-                            <form onSubmit={(e) => void handleSendE2eeVerification(e)} className="flex gap-1.5">
+                            <form
+                              onSubmit={(e) => void handleSendE2eeVerification(e)}
+                              noValidate
+                              className="flex gap-1.5"
+                            >
                               <input
                                 type="text"
                                 value={e2eeMessageInput}
-                                onChange={(e) => setE2eeMessageInput(e.target.value)}
-                                placeholder="Enviar prueba cifrada a CORE..."
-                                className="flex-1 h-8 px-2.5 rounded-lg bg-[#0B1220] border border-[#22324C] text-[10px] text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
+                                onChange={(e) => {
+                                  setE2eeMessageInput(e.target.value);
+                                  if (e2eeNotice) setE2eeNotice(null);
+                                }}
+                                placeholder="Escribe un mensaje para CORE (obligatorio)..."
+                                className="flex-1 h-8 px-2.5 rounded-lg bg-[#0B1220] border border-[#22324C] text-[11px] text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
                               />
                               <button
                                 type="submit"
-                                disabled={isSendingE2ee || relaySnapshot.connectionState !== 'LINKED'}
-                                className="h-8 px-2.5 rounded-lg bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-bold text-[10px] flex items-center gap-1 cursor-pointer disabled:opacity-45 shrink-0"
+                                disabled={isSendingE2ee}
+                                className="h-8 px-3 rounded-lg bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-bold text-[11px] flex items-center gap-1 cursor-pointer disabled:opacity-45 shrink-0"
                               >
                                 <Send className="w-3 h-3" />
                                 <span>Enviar</span>
                               </button>
                             </form>
 
+                            {e2eeNotice && (
+                              <p className="text-[10px] text-[#F59E0B] leading-tight">{e2eeNotice}</p>
+                            )}
+
                             {relaySnapshot.operations.slice(0, 2).map((op) => {
                               const st = formatOpStatusLabel(op.status);
                               return (
                                 <div
                                   key={op.operationId}
-                                  className="p-1.5 rounded-lg bg-[#0B1220] border border-[#22324C] text-[9px] space-y-0.5"
+                                  className="p-2 rounded-lg bg-[#0B1220] border border-[#22324C] text-[10px] space-y-0.5"
                                 >
                                   <div className="flex items-center justify-between">
                                     <span className="text-white truncate">{op.previewLabel}</span>
@@ -2425,55 +3232,107 @@ export function App() {
                             })}
 
                             {relaySnapshot.receivedMessages.length > 0 && (
-                              <div className="p-1.5 rounded-lg bg-[#10B981]/10 border border-[#10B981]/25 text-[9px] space-y-1">
+                              <div className="p-2 rounded-lg bg-[#10B981]/10 border border-[#10B981]/25 text-[10px] space-y-1.5">
                                 <div className="flex items-center justify-between gap-2">
                                   <span className="text-[#10B981] font-bold">
-                                    Recibido en memoria (sin guardar en disco):
+                                    Recibidos solo en memoria ({relaySnapshot.receivedMessages.length}):
                                   </span>
                                   <button
                                     type="button"
                                     onClick={() => relayClientRef.current?.clearReceivedMessages()}
-                                    className="text-[9px] text-[#00CFE8] hover:underline font-semibold cursor-pointer shrink-0"
+                                    className="text-[10px] text-[#00CFE8] hover:underline font-semibold cursor-pointer shrink-0"
                                   >
                                     Limpiar memoria
                                   </button>
                                 </div>
-                                <span className="text-white break-words block">
-                                  {relaySnapshot.receivedMessages[0].text}
-                                </span>
+                                <div className="max-h-36 overflow-y-auto space-y-1">
+                                  {relaySnapshot.receivedMessages.map((msg) => (
+                                    <div
+                                      key={msg.operationId}
+                                      className="p-1.5 rounded bg-[#0B1220] border border-[#22324C] space-y-0.5"
+                                    >
+                                      <span className="text-white break-words block">{msg.text}</span>
+                                      {msg.timestamp ? (
+                                        <span className="text-[9px] text-[#94A3B8] block">
+                                          {new Date(msg.timestamp).toLocaleTimeString()}
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                  ))}
+                                </div>
                               </div>
                             )}
                           </div>
                         )}
 
-                      {/* Arquitectura de Acceso Autorizado */}
-                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-1.5">
+                      {/* Transferencia cifrada de archivos hacia VEL CORE */}
+                      {fileTransferService && (
+                        <MobileFileTransferPanel
+                          transferService={fileTransferService}
+                          snapshot={fileTransferSnapshot}
+                          connectionState={relaySnapshot.connectionState}
+                          peerOnline={relaySnapshot.peerOnline}
+                          isRevoked={deviceIdentity.registrationStatus === 'revoked'}
+                          isPaired={Boolean(
+                            deviceIdentity.pairedPeerDeviceId &&
+                              deviceIdentity.registrationStatus === 'paired'
+                          )}
+                        />
+                      )}
+
+                      {/* Garantía de uso */}
+                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-1">
                         <div className="flex items-center gap-2 text-white">
-                          <Lock className="w-3.5 h-3.5 text-[#00CFE8]" />
-                          <h4 className="text-[11px] font-bold uppercase tracking-wider">Terminal de Acceso y Operación</h4>
+                          <Lock className="w-3.5 h-3.5 text-[#10B981]" />
+                          <h4 className="text-xs font-bold">Sin almacenamiento personal en móvil</h4>
                         </div>
-                        <p className="text-[10px] text-[#94A3B8] leading-snug">
-                          VEL CORE es el custodio exclusivo. No se guardan mensajes, fotos ni datos personales en este teléfono móvil.
+                        <p className="text-[11px] text-[#94A3B8] leading-snug">
+                          Tu información personal permanece resguardada únicamente en tu teléfono principal VEL CORE.
                         </p>
                       </div>
 
-                      {/* Datos técnicos reales persistidos localmente */}
-                      <div className="p-2.5 rounded-2xl bg-[#0B1220] border border-[#22324C] space-y-1 text-[10px]">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[11px] font-bold text-white">Estado técnico local:</span>
-                          <button
-                            type="button"
-                            onClick={handleRefreshDeviceSession}
-                            disabled={isRetryingSync}
-                            className="text-[10px] text-[#00CFE8] hover:underline cursor-pointer disabled:opacity-50"
-                          >
-                            {isRetryingSync ? 'Sincronizando...' : 'Sincronizar'}
-                          </button>
-                        </div>
-                        <div className="flex justify-between text-[#94A3B8] font-mono">
-                          <span>Huella pública:</span>
-                          <span className="text-[#00CFE8]">{deviceIdentity.fingerprint.slice(0, 17)}...</span>
-                        </div>
+                      {/* Apartado colapsable de información técnica avanzada */}
+                      <div className="rounded-xl bg-[#0B1220] border border-[#22324C] overflow-hidden">
+                        <button
+                          type="button"
+                          onClick={() => setShowTerminalAdvancedTech((prev) => !prev)}
+                          className="w-full px-3 py-2 flex items-center justify-between text-[11px] font-semibold text-[#94A3B8] hover:text-white cursor-pointer"
+                        >
+                          <span>Información técnica avanzada</span>
+                          {showTerminalAdvancedTech ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+                        {showTerminalAdvancedTech && (
+                          <div className="px-3 pb-3 pt-1.5 border-t border-[#22324C] space-y-1.5 font-mono text-[10px] text-[#94A3B8]">
+                            <div className="flex justify-between gap-2">
+                              <span>ID dispositivo:</span>
+                              <span className="text-white truncate">{deviceIdentity.deviceId}</span>
+                            </div>
+                            <div className="flex justify-between gap-2">
+                              <span>Huella SHA-256:</span>
+                              <span className="text-[#00CFE8]">{deviceIdentity.fingerprint.slice(0, 17)}...</span>
+                            </div>
+                            {deviceIdentity.pairedPeerDeviceId && (
+                              <div className="flex justify-between gap-2">
+                                <span>CORE asociado:</span>
+                                <span className="text-white truncate">{deviceIdentity.pairedPeerDeviceId}</span>
+                              </div>
+                            )}
+                            <div className="pt-1 flex justify-end">
+                              <button
+                                type="button"
+                                onClick={handleRefreshDeviceSession}
+                                disabled={isRetryingSync}
+                                className="font-sans text-[11px] text-[#00CFE8] hover:underline cursor-pointer disabled:opacity-50"
+                              >
+                                {isRetryingSync ? 'Sincronizando...' : 'Sincronizar estado con servidor'}
+                              </button>
+                            </div>
+                            {setupError && <p className="font-sans text-[10px] text-[#F59E0B]">{setupError}</p>}
+                            {relaySnapshot.lastError && (
+                              <p className="font-sans text-[10px] text-[#EF4444]">{relaySnapshot.lastError}</p>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -2493,44 +3352,66 @@ export function App() {
                 )}
 
                 {/* ============================================== */}
-                {/* 5. PANTALLA: EMPAREJAMIENTO EN VIVO CON SAS (CORE) */}
+                {/* 5. PANTALLA: VINCULAR TELÉFONO MÓVIL (CORE) */}
                 {/* ============================================== */}
                 {!isLoadingIdentity && currentScreen === 'PAIRING_CORE' && deviceIdentity && (
                   <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
                     <div className="space-y-3">
                       <button
-                        onClick={() => setCurrentScreen('CORE_HOME')}
-                        className="h-9 px-3 -ml-2 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
+                        type="button"
+                        onClick={() => goBack('CORE_HOME')}
+                        className="h-9 px-3 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] inline-flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
                       >
-                        <ArrowLeft className="w-4 h-4" />
-                        <span>← Volver</span>
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>VOLVER</span>
                       </button>
 
                       <div className="space-y-0.5">
                         <h2 className="text-base font-bold text-white">Vincular teléfono móvil</h2>
                         <p className="text-xs text-[#94A3B8]">
-                          Invitación efímera de un solo uso y verificación criptográfica SAS de 6 dígitos.
+                          Paso 1: genera un código de invitación temporal de 8 caracteres. Paso 2: confirma que el código SAS de 6 dígitos coincida en ambos teléfonos.
                         </p>
                       </div>
 
-                      {!relayConfig.configured && (
-                        <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-[11px] text-[#F59E0B] space-y-1">
-                          <strong>Relay WebSocket no configurado:</strong>
-                          <p className="text-[10px] text-white/85">
-                            Configura la variable <code className="text-[#00CFE8]">VEL_RELAY_WSS_URL</code> en Netlify apuntando al servidor Relay desplegado para habilitar el emparejamiento entre dos teléfonos.
+                      {deviceIdentity.registrationStatus === 'pending_local' && (
+                        <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/35 text-[11px] text-[#F59E0B] space-y-2">
+                          <p className="leading-snug">
+                            <strong>Registro en la nube pendiente:</strong> primero completa el registro de VEL CORE para poder generar códigos de invitación.
                           </p>
+                          <button
+                            type="button"
+                            onClick={handleRetryServerRegistration}
+                            disabled={isRetryingSync}
+                            className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                          >
+                            {isRetryingSync ? 'Registrando...' : 'Completar registro en la nube'}
+                          </button>
                         </div>
                       )}
 
+                      {relaySnapshot.connectionState !== 'AUTHENTICATED' &&
+                        relaySnapshot.connectionState !== 'LINKED' && (
+                          <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-[11px] text-[#F59E0B] flex items-center justify-between gap-2">
+                            <span>Conectando con el servicio de comunicación...</span>
+                            <button
+                              type="button"
+                              onClick={handleReconnectRelay}
+                              className="px-2.5 py-1 rounded-lg bg-[#18263E] text-[#00CFE8] font-bold text-[10px] cursor-pointer shrink-0"
+                            >
+                              Reconectar
+                            </button>
+                          </div>
+                        )}
+
                       {relaySnapshot.pairingSession?.stage === 'OFFERING' && (
                         <div className="p-4 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/40 space-y-3 text-center">
-                          <span className="text-[10px] text-[#94A3B8] uppercase font-bold tracking-wider block">
-                            Código temporal (válido 5 minutos)
+                          <span className="text-[11px] text-[#94A3B8] font-bold block">
+                            Paso 1 · Código de invitación de 8 caracteres (válido 5 minutos)
                           </span>
                           <div className="text-2xl font-mono font-extrabold text-[#00CFE8] tracking-widest bg-[#0B1220] py-2.5 rounded-xl border border-[#22324C]">
                             {relaySnapshot.pairingSession.code}
                           </div>
-                          <div className="flex items-center justify-center gap-3 text-[10px] text-[#94A3B8]">
+                          <div className="flex items-center justify-center gap-3 text-[11px] text-[#94A3B8]">
                             <span>
                               Expira en:{' '}
                               <strong className="text-white font-mono">
@@ -2551,15 +3432,15 @@ export function App() {
                               <span>{copiedPairingCode ? 'Copiado' : 'Copiar'}</span>
                             </button>
                           </div>
-                          <p className="text-[10px] text-[#94A3B8] leading-snug">
-                            Ingresa este código en tu teléfono VEL MÓVIL. Luego ambos mostrarán el código SAS de 6 dígitos para comparar cara a cara.
+                          <p className="text-[11px] text-[#94A3B8] leading-snug">
+                            Escribe este código de 8 caracteres (formato <span className="font-mono text-white">XXXX-XXXX</span>) en tu VEL MÓVIL. Después ambos mostrarán un código SAS distinto de 6 dígitos para verificar cara a cara.
                           </p>
                           <button
                             type="button"
                             onClick={() => relayClientRef.current!.cancelPairing()}
-                            className="w-full h-8 rounded-lg border border-[#EF4444]/40 text-[#EF4444] text-[10px] font-bold cursor-pointer"
+                            className="w-full h-8 rounded-lg border border-[#EF4444]/40 text-[#EF4444] text-[11px] font-bold cursor-pointer"
                           >
-                            Cancelar invitación
+                            Cancelar código
                           </button>
                         </div>
                       )}
@@ -2568,31 +3449,18 @@ export function App() {
                         relaySnapshot.pairingSession?.stage === 'SAS_AWAITING_PEER') && (
                         <div className="p-4 rounded-2xl bg-[#111C2E] border-2 border-[#00CFE8] space-y-3">
                           <div className="text-center space-y-1">
-                            <span className="text-[10px] font-bold text-[#00CFE8] uppercase tracking-wider block">
-                              Verificación cara a cara (Código SAS)
+                            <span className="text-[11px] font-bold text-[#00CFE8] uppercase tracking-wider block">
+                              Paso 2 · Código SAS de 6 dígitos (verificación cara a cara)
                             </span>
                             <div className="text-3xl font-mono font-extrabold tracking-[0.22em] text-white py-2 bg-[#0B1220] rounded-xl border border-[#22324C]">
                               {relaySnapshot.pairingSession.sasCode}
                             </div>
                           </div>
 
-                          <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] text-[10px] font-mono space-y-1">
-                            <div className="flex justify-between text-[#94A3B8]">
-                              <span>MÓVIL detectado:</span>
-                              <span className="text-white">{relaySnapshot.pairingSession.peerDeviceId}</span>
-                            </div>
-                            <div className="flex justify-between text-[#94A3B8]">
-                              <span>Huella par:</span>
-                              <span className="text-[#00CFE8]">
-                                {relaySnapshot.pairingSession.peerFingerprint?.slice(0, 17)}...
-                              </span>
-                            </div>
-                          </div>
-
                           {relaySnapshot.pairingSession.localConfirmedSas ? (
                             <div className="space-y-2">
-                              <div className="p-2.5 rounded-xl bg-[#00CFE8]/10 border border-[#00CFE8]/30 text-[10px] text-[#00CFE8] text-center">
-                                ✓ Emparejamiento pendiente: confirmado en VEL CORE. Ahora pulsa «Confirmar SAS» también en tu VEL MÓVIL.
+                              <div className="p-2.5 rounded-xl bg-[#00CFE8]/10 border border-[#00CFE8]/30 text-[11px] text-[#00CFE8] text-center">
+                                ✓ Confirmado en VEL CORE. Ahora pulsa «Confirmar SAS» en tu VEL MÓVIL.
                               </div>
                               <button
                                 type="button"
@@ -2604,8 +3472,8 @@ export function App() {
                             </div>
                           ) : (
                             <>
-                              <p className="text-[10px] text-[#94A3B8] leading-snug text-center">
-                                Confirma únicamente si este código de 6 dígitos coincide en ambos teléfonos. Ambos dispositivos deben confirmar.
+                              <p className="text-[11px] text-[#94A3B8] leading-snug text-center">
+                                Confirma únicamente si este código SAS de 6 dígitos coincide en ambos teléfonos.
                               </p>
 
                               <div className="grid grid-cols-2 gap-2">
@@ -2632,9 +3500,9 @@ export function App() {
                       {relaySnapshot.pairingSession?.stage === 'CONFIRMED' && (
                         <div className="p-4 rounded-2xl bg-[#10B981]/10 border border-[#10B981]/40 space-y-2 text-center">
                           <CheckCircle className="w-8 h-8 text-[#10B981] mx-auto" />
-                          <h3 className="text-xs font-bold text-white">Vinculación cifrada E2EE activada</h3>
-                          <p className="text-[10px] text-[#94A3B8]">
-                            Autorización persistida en Firestore y clave AES-256-GCM derivada en ambos dispositivos.
+                          <h3 className="text-xs font-bold text-white">Teléfono móvil vinculado</h3>
+                          <p className="text-[11px] text-[#94A3B8]">
+                            Ambos teléfonos quedaron autorizados y protegidos de extremo a extremo.
                           </p>
                         </div>
                       )}
@@ -2655,15 +3523,46 @@ export function App() {
                           >
                             {isStartingPairingOffer ? 'Generando código...' : 'Generar código de emparejamiento'}
                           </button>
-
-                          <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] space-y-1 text-[10px]">
-                            <span className="text-[#94A3B8] block">ID público de este VEL CORE:</span>
-                            <span className="font-mono text-white font-bold block">{deviceIdentity.deviceId}</span>
-                            <span className="text-[#94A3B8] block pt-0.5">Huella SHA-256:</span>
-                            <span className="font-mono text-[#00CFE8] break-all">{deviceIdentity.fingerprint}</span>
-                          </div>
+                          <p className="text-[11px] text-[#94A3B8] text-center leading-snug">
+                            El código caduca automáticamente después de 5 minutos por seguridad.
+                          </p>
                         </div>
                       )}
+
+                      <div className="rounded-xl bg-[#0B1220] border border-[#22324C] overflow-hidden">
+                        <button
+                          type="button"
+                          onClick={() => setShowPairingAdvancedTech((prev) => !prev)}
+                          className="w-full px-3 py-2 flex items-center justify-between text-[11px] font-semibold text-[#94A3B8] hover:text-white cursor-pointer"
+                        >
+                          <span>Información técnica avanzada</span>
+                          {showPairingAdvancedTech ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+                        {showPairingAdvancedTech && (
+                          <div className="px-3 pb-2.5 pt-1 border-t border-[#22324C] space-y-1 font-mono text-[10px] text-[#94A3B8]">
+                            <div className="flex justify-between gap-2">
+                              <span>ID VEL CORE:</span>
+                              <span className="text-white truncate">{deviceIdentity.deviceId}</span>
+                            </div>
+                            <div>
+                              <span className="block">Huella SHA-256:</span>
+                              <span className="text-[#00CFE8] break-all">{deviceIdentity.fingerprint}</span>
+                            </div>
+                            {relaySnapshot.pairingSession?.peerDeviceId && (
+                              <div className="flex justify-between gap-2 pt-1">
+                                <span>MÓVIL par:</span>
+                                <span className="text-white truncate">{relaySnapshot.pairingSession.peerDeviceId}</span>
+                              </div>
+                            )}
+                            {relaySnapshot.pairingSession?.peerFingerprint && (
+                              <div className="flex justify-between gap-2">
+                                <span>Huella par:</span>
+                                <span className="text-[#00CFE8]">{relaySnapshot.pairingSession.peerFingerprint.slice(0, 17)}...</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
 
                       {relaySnapshot.lastError && (
                         <p className="text-[10px] text-[#EF4444] text-center">{relaySnapshot.lastError}</p>
@@ -2671,10 +3570,12 @@ export function App() {
                     </div>
 
                     <button
-                      onClick={() => setCurrentScreen('CORE_HOME')}
-                      className="w-full h-10 rounded-xl bg-[#18263E] text-white font-bold text-xs cursor-pointer"
+                      type="button"
+                      onClick={() => goBack('CORE_HOME')}
+                      className="w-full h-10 rounded-xl bg-[#18263E] hover:bg-[#22324C] text-white font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer"
                     >
-                      Volver a VEL CORE
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                      <span>VOLVER</span>
                     </button>
                   </div>
                 )}
@@ -2686,20 +3587,21 @@ export function App() {
                   <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
                     <div className="space-y-3">
                       <button
+                        type="button"
                         onClick={() => {
                           setRevokeFeedback(null);
-                          setCurrentScreen('CORE_HOME');
+                          goBack('CORE_HOME');
                         }}
-                        className="h-9 px-3 -ml-2 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
+                        className="h-9 px-3 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] inline-flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
                       >
-                        <ArrowLeft className="w-4 h-4" />
-                        <span>← Volver</span>
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>VOLVER</span>
                       </button>
 
                       <div className="space-y-0.5">
                         <h2 className="text-base font-bold text-white">Administración de dispositivos</h2>
                         <p className="text-xs text-[#94A3B8]">
-                          Control de autorizaciones activas en Firestore y Relay WebSocket.
+                          Controla qué teléfono móvil tiene permiso para conectarse con tu VEL CORE.
                         </p>
                       </div>
 
@@ -2708,19 +3610,17 @@ export function App() {
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2">
                               <Smartphone className="w-4 h-4 text-[#00CFE8]" />
-                              <span className="text-xs font-bold text-white font-mono">
-                                {deviceIdentity.pairedPeerDeviceId}
+                              <span className="text-xs font-bold text-white">
+                                Teléfono móvil vinculado
                               </span>
                             </div>
                             <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-[#10B981]/15 text-[#10B981]">
                               Autorizado
                             </span>
                           </div>
-                          {deviceIdentity.activeLinkId && (
-                            <div className="text-[10px] text-[#94A3B8] font-mono">
-                              Vínculo ID: {deviceIdentity.activeLinkId}
-                            </div>
-                          )}
+                          <p className="text-[11px] text-[#94A3B8] leading-snug">
+                            Si ya no usas este teléfono, puedes retirar su autorización de inmediato.
+                          </p>
                           <button
                             type="button"
                             onClick={() => void handleRevokePeerDevice('Revocado desde Administración de VEL CORE')}
@@ -2732,15 +3632,15 @@ export function App() {
                         </div>
                       ) : (
                         <div className="p-4 rounded-2xl bg-[#111C2E] border border-[#22324C] text-center space-y-1.5">
-                          <p className="text-xs font-bold text-white">Sin dispositivos móviles vinculados</p>
-                          <p className="text-[10px] text-[#94A3B8] leading-relaxed">
-                            No existen autorizaciones activas en Firestore para este VEL CORE actualmente.
+                          <p className="text-xs font-bold text-white">Sin teléfono móvil vinculado</p>
+                          <p className="text-[11px] text-[#94A3B8] leading-relaxed">
+                            Actualmente no hay ningún teléfono móvil autorizado en este VEL CORE.
                           </p>
                         </div>
                       )}
 
                       {revokeFeedback && (
-                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] space-y-1 text-[10px]">
+                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] space-y-1 text-[11px]">
                           {(() => {
                             const rb = formatRevocationBadge(relaySnapshot.revocationStatus);
                             return rb ? (
@@ -2754,19 +3654,56 @@ export function App() {
                       )}
 
                       <button
-                        onClick={() => setCurrentScreen('REPLACE_PHONE')}
+                        type="button"
+                        onClick={() => navigateTo('REPLACE_PHONE')}
                         className="w-full h-10 rounded-xl bg-[#18263E] hover:bg-[#22324C] border border-[#00CFE8]/30 text-[#00CFE8] font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
                       >
                         <RefreshCw className="w-3.5 h-3.5" />
                         <span>Reemplazar teléfono perdido o nuevo</span>
                       </button>
+
+                      <div className="rounded-xl bg-[#0B1220] border border-[#22324C] overflow-hidden">
+                        <button
+                          type="button"
+                          onClick={() => setShowManageAdvancedTech((prev) => !prev)}
+                          className="w-full px-3 py-2 flex items-center justify-between text-[11px] font-semibold text-[#94A3B8] hover:text-white cursor-pointer"
+                        >
+                          <span>Información técnica avanzada</span>
+                          {showManageAdvancedTech ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+                        {showManageAdvancedTech && (
+                          <div className="px-3 pb-2.5 pt-1 border-t border-[#22324C] space-y-1 font-mono text-[10px] text-[#94A3B8]">
+                            <div className="flex justify-between gap-2">
+                              <span>ID VEL CORE:</span>
+                              <span className="text-white truncate">{deviceIdentity.deviceId}</span>
+                            </div>
+                            {deviceIdentity.pairedPeerDeviceId && (
+                              <div className="flex justify-between gap-2">
+                                <span>ID MÓVIL par:</span>
+                                <span className="text-white truncate">{deviceIdentity.pairedPeerDeviceId}</span>
+                              </div>
+                            )}
+                            {deviceIdentity.activeLinkId && (
+                              <div className="flex justify-between gap-2">
+                                <span>Vínculo ID:</span>
+                                <span className="text-[#00CFE8] truncate">{deviceIdentity.activeLinkId}</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     <button
-                      onClick={() => setCurrentScreen('CORE_HOME')}
-                      className="w-full h-10 rounded-xl bg-[#18263E] text-white font-bold text-xs cursor-pointer"
+                      type="button"
+                      onClick={() => {
+                        setRevokeFeedback(null);
+                        goBack('CORE_HOME');
+                      }}
+                      className="w-full h-10 rounded-xl bg-[#18263E] hover:bg-[#22324C] text-white font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer"
                     >
-                      Volver a VEL CORE
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                      <span>VOLVER</span>
                     </button>
                   </div>
                 )}
@@ -2778,20 +3715,21 @@ export function App() {
                   <div className="flex-1 px-5 py-4 flex flex-col justify-between space-y-3 overflow-y-auto">
                     <div className="space-y-3">
                       <button
+                        type="button"
                         onClick={() => {
                           setRevokeFeedback(null);
-                          setCurrentScreen('CORE_HOME');
+                          goBack('CORE_HOME');
                         }}
-                        className="h-9 px-3 -ml-2 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
+                        className="h-9 px-3 rounded-xl text-[#00CFE8] hover:text-white bg-[#111C2E] border border-[#22324C] inline-flex items-center gap-1.5 text-xs font-bold transition-all cursor-pointer shadow-sm"
                       >
-                        <ArrowLeft className="w-4 h-4" />
-                        <span>← Volver</span>
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>VOLVER</span>
                       </button>
 
                       <div className="space-y-0.5">
-                        <h2 className="text-base font-bold text-white">REEMPLAZAR TELÉFONO MÓVIL</h2>
+                        <h2 className="text-base font-bold text-white">Reemplazar teléfono móvil</h2>
                         <p className="text-xs text-[#94A3B8]">
-                          Sustitución segura conservando intacta la identidad y custodia de VEL CORE.
+                          Cambia tu teléfono diario manteniendo intactos tus datos e identidad de VEL CORE.
                         </p>
                       </div>
 
@@ -2801,42 +3739,42 @@ export function App() {
                             <Shield className="w-3.5 h-3.5 text-[#00CFE8]" />
                             <span>Custodio: VEL CORE</span>
                           </span>
-                          <span className="text-[10px] font-mono text-[#00CFE8] bg-[#00CFE8]/10 px-2 py-0.5 rounded font-bold">
-                            IDENTIDAD INTACTA
+                          <span className="text-[10px] text-[#10B981] font-bold">
+                            Datos protegidos
                           </span>
                         </div>
-                        <p className="text-[10px] text-[#94A3B8]">
-                          ID: <span className="font-mono text-white">{deviceIdentity.deviceId}</span> • Las claves locales de CORE no se modifican ni se transfieren.
+                        <p className="text-[11px] text-[#94A3B8]">
+                          Tu información personal y claves principales permanecen intactas en este dispositivo.
                         </p>
                       </div>
 
                       <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2">
                         <span className="text-xs font-bold text-white block">
-                          Paso 1: Revocar teléfono anterior
+                          Paso 1: Retirar acceso al teléfono anterior
                         </span>
                         {deviceIdentity.pairedPeerDeviceId ? (
                           <>
-                            <div className="p-2 rounded-xl bg-[#0B1220] border border-[#22324C] text-[11px] font-mono text-white">
-                              ID: {deviceIdentity.pairedPeerDeviceId}
-                            </div>
+                            <p className="text-[11px] text-[#94A3B8]">
+                              Hay un teléfono móvil actualmente vinculado. Revoca su permiso antes de asociar el nuevo.
+                            </p>
                             <button
                               type="button"
                               onClick={() => void handleRevokePeerDevice('Reemplazo de teléfono móvil desde VEL CORE')}
                               disabled={isRevokingPeer}
                               className="w-full h-9 rounded-xl bg-[#EF4444] hover:bg-[#DC2626] text-white font-bold text-xs cursor-pointer disabled:opacity-50"
                             >
-                              {isRevokingPeer ? 'Revocando teléfono anterior...' : 'Revocar terminal anterior ahora'}
+                              {isRevokingPeer ? 'Revocando teléfono anterior...' : 'Revocar teléfono anterior ahora'}
                             </button>
                           </>
                         ) : (
                           <div className="text-[11px] text-[#10B981] p-2 rounded-xl bg-[#10B981]/10 border border-[#10B981]/25">
-                            ✓ Sin terminal activo vinculado. Listo para vincular un nuevo VEL MÓVIL.
+                            ✓ Sin teléfono móvil activo vinculado. Listo para vincular el nuevo.
                           </div>
                         )}
                       </div>
 
                       {revokeFeedback && (
-                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#00CFE8]/30 text-[10px] text-[#00CFE8]">
+                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#00CFE8]/30 text-[11px] text-[#00CFE8]">
                           {revokeFeedback}
                         </div>
                       )}
@@ -2848,7 +3786,7 @@ export function App() {
                             {revBadge && (
                               <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#22324C] space-y-1">
                                 <div className="flex items-center justify-between">
-                                  <span className="text-[10px] font-bold text-white">Estado de revocación</span>
+                                  <span className="text-[11px] font-bold text-white">Estado de revocación</span>
                                   <span className={`text-[9px] font-bold px-2 py-0.5 rounded border ${revBadge.cls}`}>
                                     {revBadge.label}
                                   </span>
@@ -2861,17 +3799,17 @@ export function App() {
                               </div>
                             )}
 
-                            <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2 text-[10px] text-[#94A3B8]">
+                            <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2 text-[11px] text-[#94A3B8]">
                               <strong className="text-white text-xs block">Paso 2: Vincular nuevo VEL MÓVIL</strong>
                               <p className="leading-relaxed">
                                 {deviceIdentity.pairedPeerDeviceId
-                                  ? 'Primero ejecuta el Paso 1 para revocar el terminal anterior. Cuando Firestore confirme la revocación, podrás generar un nuevo código efímero.'
-                                  : 'Genera un nuevo código efímero y confirma el código SAS de 6 dígitos en ambos teléfonos (CORE y nuevo VEL MÓVIL).'}
+                                  ? 'Primero completa el Paso 1 para retirar el permiso del teléfono anterior.'
+                                  : 'Genera un código de invitación de 8 caracteres y confirma después el código SAS de 6 dígitos en ambos teléfonos.'}
                               </p>
                               <button
                                 type="button"
                                 disabled={Boolean(deviceIdentity.pairedPeerDeviceId)}
-                                onClick={() => setCurrentScreen('PAIRING_CORE')}
+                                onClick={() => navigateTo('PAIRING_CORE')}
                                 className="w-full h-9 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-xs cursor-pointer disabled:opacity-45"
                               >
                                 Ir a vincular nuevo VEL MÓVIL
@@ -2881,21 +3819,51 @@ export function App() {
                         );
                       })()}
 
-                      <div className="p-3 rounded-xl bg-[#0B1220] border border-[#22324C] text-[10px] text-[#94A3B8] space-y-1">
+                      <div className="p-3 rounded-xl bg-[#0B1220] border border-[#22324C] text-[11px] text-[#94A3B8] space-y-1">
                         <p>
-                          <strong className="text-white">Sin nuevo contrato ni cobro:</strong> El reemplazo no exige una nueva suscripción ni altera tu cuenta comercial.
+                          <strong className="text-white">Sin costo adicional:</strong> El reemplazo no requiere una nueva contratación.
                         </p>
                         <p>
-                          <strong className="text-white">Soberanía de datos:</strong> Ninguna información personal custodiada en CORE es transferida ni borrada durante el reemplazo.
+                          <strong className="text-white">Datos a salvo:</strong> Ninguna información guardada en VEL CORE se borra al cambiar tu móvil.
                         </p>
+                      </div>
+
+                      <div className="rounded-xl bg-[#0B1220] border border-[#22324C] overflow-hidden">
+                        <button
+                          type="button"
+                          onClick={() => setShowReplaceAdvancedTech((prev) => !prev)}
+                          className="w-full px-3 py-2 flex items-center justify-between text-[11px] font-semibold text-[#94A3B8] hover:text-white cursor-pointer"
+                        >
+                          <span>Información técnica avanzada</span>
+                          {showReplaceAdvancedTech ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+                        {showReplaceAdvancedTech && (
+                          <div className="px-3 pb-2.5 pt-1 border-t border-[#22324C] space-y-1 font-mono text-[10px] text-[#94A3B8]">
+                            <div className="flex justify-between gap-2">
+                              <span>ID VEL CORE:</span>
+                              <span className="text-white truncate">{deviceIdentity.deviceId}</span>
+                            </div>
+                            {deviceIdentity.pairedPeerDeviceId && (
+                              <div className="flex justify-between gap-2">
+                                <span>ID MÓVIL vinculado:</span>
+                                <span className="text-white truncate">{deviceIdentity.pairedPeerDeviceId}</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
 
                     <button
-                      onClick={() => setCurrentScreen('CORE_HOME')}
-                      className="w-full h-10 rounded-xl bg-[#18263E] text-white font-bold text-xs cursor-pointer"
+                      type="button"
+                      onClick={() => {
+                        setRevokeFeedback(null);
+                        goBack('CORE_HOME');
+                      }}
+                      className="w-full h-10 rounded-xl bg-[#18263E] hover:bg-[#22324C] text-white font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer"
                     >
-                      Volver a VEL CORE
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                      <span>VOLVER</span>
                     </button>
                   </div>
                 )}
@@ -2907,6 +3875,7 @@ export function App() {
                   <div className="absolute inset-0 bg-black/85 backdrop-blur-sm p-4 flex items-center justify-center z-50">
                     <form
                       onSubmit={handleExecuteControlledRoleChange}
+                      noValidate
                       className="bg-[#111C2E] border border-[#F59E0B]/50 rounded-2xl p-5 space-y-3 max-w-xs w-full shadow-2xl text-xs"
                     >
                       <div className="flex items-center gap-2 text-[#F59E0B]">
@@ -2915,17 +3884,20 @@ export function App() {
                       </div>
 
                       <p className="text-[11px] text-[#94A3B8] leading-relaxed">
-                        El rol de este dispositivo persiste entre sesiones. Cambiarlo revocará la identidad técnica actual (<span className="font-mono text-white">{deviceIdentity?.deviceId}</span>) en Firestore y generará nuevas claves locales.
+                        El rol de este teléfono se conserva entre sesiones. Si decides cambiarlo, la identidad actual se revocará y se preparará una nueva.
                       </p>
 
                       <div className="space-y-1">
                         <label className="text-[10px] text-[#94A3B8] block">
-                          Escribe exactamente <strong className="text-white">{ROLE_CHANGE_CONFIRMATION_KEYWORD}</strong> para continuar:
+                          Escribe exactamente <strong className="text-white">{ROLE_CHANGE_CONFIRMATION_KEYWORD}</strong> para continuar (obligatorio):
                         </label>
                         <input
                           type="text"
                           value={roleChangeConfirmInput}
-                          onChange={(e) => setRoleChangeConfirmInput(e.target.value)}
+                          onChange={(e) => {
+                            setRoleChangeConfirmInput(e.target.value);
+                            if (roleChangeError) setRoleChangeError(null);
+                          }}
                           placeholder={ROLE_CHANGE_CONFIRMATION_KEYWORD}
                           className="w-full h-9 px-3 bg-[#0B1220] border border-[#22324C] rounded-xl text-xs font-mono text-white focus:outline-none focus:border-[#F59E0B]"
                         />
@@ -3121,16 +4093,26 @@ export function App() {
         {/* ========================================================= */}
         {viewMode === 'WEB_PORTAL' && (
           <div className="max-w-2xl w-full bg-[#111C2E] border border-[#22324C] rounded-3xl p-6 sm:p-8 space-y-6 shadow-2xl">
-            <div className="border-b border-[#22324C] pb-4 space-y-1">
-              <div className="flex items-center gap-2 text-[#00CFE8]">
-                <CreditCard className="w-5 h-5" />
-                <span className="text-xs font-bold uppercase tracking-wider">Portal Web Oficial</span>
+            <div className="border-b border-[#22324C] pb-4 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-[#00CFE8]">
+                  <CreditCard className="w-5 h-5" />
+                  <span className="text-xs font-bold uppercase tracking-wider">Portal Web Oficial</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={goHome}
+                  className="h-8 px-3 rounded-lg bg-[#0B1220] hover:bg-[#18263E] border border-[#22324C] text-[#00CFE8] hover:text-white text-xs font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  <span>VOLVER AL INICIO</span>
+                </button>
               </div>
               <h2 className="text-xl sm:text-2xl font-extrabold text-white">
                 Contratación y Suscripción del Servicio VEL
               </h2>
               <p className="text-xs text-[#94A3B8]">
-                Circuito comercial oficial conectado con Firebase Auth, Cloud Firestore y Mercado Pago Checkout Pro.
+                Acceso sin contraseña y pago mensual manual a través de Mercado Pago.
               </p>
             </div>
 
@@ -3216,15 +4198,18 @@ export function App() {
                     </button>
                   </div>
                 ) : needsLinkEmailConfirm ? (
-                  <form onSubmit={handleConfirmEmailForLink} className="space-y-3">
+                  <form onSubmit={handleConfirmEmailForLink} noValidate className="space-y-3">
                     <p className="text-[11px] text-[#F59E0B] leading-relaxed">
                       Abriste el enlace de acceso en un navegador distinto. Confirma tu correo electrónico para validar el enlace de un solo uso y recuperar tu cuenta:
                     </p>
                     <input
                       type="email"
                       value={confirmLinkEmailInput}
-                      onChange={(e) => setConfirmLinkEmailInput(e.target.value)}
-                      placeholder="Confirma tu correo electrónico..."
+                      onChange={(e) => {
+                        setConfirmLinkEmailInput(e.target.value);
+                        if (authError) setAuthError(null);
+                      }}
+                      placeholder="Confirma tu correo electrónico (obligatorio)..."
                       className="w-full h-10 px-3 bg-[#111C2E] border border-[#22324C] rounded-xl text-xs text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
                     />
                     {authError && <p className="text-xs text-[#EF4444] font-medium">{authError}</p>}
@@ -3237,7 +4222,7 @@ export function App() {
                     </button>
                   </form>
                 ) : (
-                  <form onSubmit={handleRequestPasswordlessLink} className="space-y-3">
+                  <form onSubmit={handleRequestPasswordlessLink} noValidate className="space-y-3">
                     <p className="text-[11px] text-[#94A3B8] leading-relaxed">
                       VEL no utiliza contraseñas. Ingresa tu correo para recibir un enlace de verificación de un solo uso. Si ya eras suscriptor, conservarás exactamente tu cuenta, tarifa histórica y vigencia actual.
                     </p>
@@ -3245,8 +4230,11 @@ export function App() {
                     <input
                       type="email"
                       value={authEmail}
-                      onChange={(e) => setAuthEmail(e.target.value)}
-                      placeholder="Correo electrónico del titular..."
+                      onChange={(e) => {
+                        setAuthEmail(e.target.value);
+                        if (authError) setAuthError(null);
+                      }}
+                      placeholder="Correo electrónico del titular (obligatorio)..."
                       className="w-full h-10 px-3 bg-[#111C2E] border border-[#22324C] rounded-xl text-xs text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
                     />
 
@@ -3424,10 +4412,10 @@ export function App() {
                             onClick={handleAuthorizedDownload}
                             disabled={isCheckingDownload}
                             className="flex-1 min-w-[180px] h-9 rounded-lg bg-[#10B981] hover:bg-[#059669] text-[#0B1220] font-bold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                            title="Paquete técnico autorizado para actualización del portal web (no es instalador móvil)"
+                            title="Paquete autorizado para suscriptores con vigencia al día"
                           >
                             <Download className="w-3.5 h-3.5" />
-                            <span>{isCheckingDownload ? 'Verificando vigencia...' : 'Paquete técnico autorizado (.zip)'}</span>
+                            <span>{isCheckingDownload ? 'Verificando vigencia...' : 'Paquete autorizado (.zip)'}</span>
                           </button>
 
                           <button
@@ -3595,14 +4583,17 @@ export function App() {
                         <strong className="text-white">Regla Comercial:</strong> Los nuevos suscriptores contratarán al precio vigente aquí configurado. Los suscriptores existentes conservan de forma inmutable el precio al que contrataron.
                       </p>
 
-                      <form onSubmit={handleUpdatePriceAdmin} className="space-y-2">
+                      <form onSubmit={handleUpdatePriceAdmin} noValidate className="space-y-2">
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <label className="text-[10px] text-[#94A3B8] block mb-1">Monto mensual:</label>
+                            <label className="text-[10px] text-[#94A3B8] block mb-1">Monto mensual (obligatorio):</label>
                             <input
                               type="number"
                               value={adminNewPrice}
-                              onChange={(e) => setAdminNewPrice(e.target.value)}
+                              onChange={(e) => {
+                                setAdminNewPrice(e.target.value);
+                                if (adminPriceMsg) setAdminPriceMsg(null);
+                              }}
                               className="w-full h-9 px-3 bg-[#111C2E] border border-[#22324C] rounded-lg text-xs text-white"
                               min="1"
                             />
@@ -3660,16 +4651,26 @@ export function App() {
         {/* ========================================================= */}
         {viewMode === 'INSTALL_INFO' && (
           <div className="max-w-2xl w-full bg-[#111C2E] border border-[#22324C] rounded-3xl p-6 sm:p-8 space-y-6 shadow-2xl">
-            <div className="border-b border-[#22324C] pb-4 space-y-1">
-              <div className="flex items-center gap-2 text-[#00CFE8]">
-                <Download className="w-5 h-5" />
-                <span className="text-xs font-bold uppercase tracking-wider">Instalación Oficial PWA</span>
+            <div className="border-b border-[#22324C] pb-4 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-[#00CFE8]">
+                  <Download className="w-5 h-5" />
+                  <span className="text-xs font-bold uppercase tracking-wider">Instalación en tu teléfono</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={goHome}
+                  className="h-8 px-3 rounded-lg bg-[#0B1220] hover:bg-[#18263E] border border-[#22324C] text-[#00CFE8] hover:text-white text-xs font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  <span>VOLVER AL INICIO</span>
+                </button>
               </div>
               <h2 className="text-xl sm:text-2xl font-extrabold text-white">
                 Instalar VEL en tus teléfonos (CORE y MÓVIL)
               </h2>
               <p className="text-xs text-[#94A3B8]">
-                Aplicación Web Progresiva oficial servida directamente desde Netlify sobre HTTPS.
+                Puedes agregar VEL a la pantalla de inicio en ambos teléfonos directamente desde el navegador.
               </p>
             </div>
 
@@ -3678,29 +4679,21 @@ export function App() {
                 <div className="flex items-center justify-between">
                   <h4 className="text-sm font-bold text-white flex items-center gap-2">
                     <CheckCircle className="w-4 h-4 text-[#10B981]" />
-                    <span>Requisitos PWA activos</span>
+                    <span>Estado de instalación</span>
                   </h4>
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-[#10B981]/15 text-[#10B981]">
-                    {pwa.isInstalled ? 'EJECUTANDO COMO PWA' : 'LISTA PARA INSTALAR'}
+                    {pwa.isInstalled ? 'YA INSTALADA EN ESTE EQUIPO' : 'LISTA PARA INSTALAR'}
                   </span>
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 text-xs">
                   <div className="p-2.5 rounded-xl bg-[#111C2E] border border-[#22324C]">
-                    <span className="text-[#94A3B8] block text-[10px]">Nombre oficial:</span>
-                    <span className="text-white font-mono text-[11px]">VEL</span>
+                    <span className="text-[#94A3B8] block text-[10px]">Aplicación:</span>
+                    <span className="text-white font-semibold text-xs">VEL</span>
                   </div>
                   <div className="p-2.5 rounded-xl bg-[#111C2E] border border-[#22324C]">
-                    <span className="text-[#94A3B8] block text-[10px]">Íconos PWA:</span>
-                    <span className="text-white font-mono text-[11px]">192 / 512 / Maskable ✓</span>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-[#111C2E] border border-[#22324C]">
-                    <span className="text-[#94A3B8] block text-[10px]">Service Worker:</span>
-                    <span className="text-white font-mono text-[11px]">sw.js (solo estáticos) ✓</span>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-[#111C2E] border border-[#22324C]">
-                    <span className="text-[#94A3B8] block text-[10px]">Modo:</span>
-                    <span className="text-white font-mono text-[11px]">standalone (start_url: /) ✓</span>
+                    <span className="text-[#94A3B8] block text-[10px]">Modo de apertura:</span>
+                    <span className="text-white font-semibold text-xs">Pantalla completa ✓</span>
                   </div>
                 </div>
 
@@ -3708,23 +4701,22 @@ export function App() {
               </div>
 
               <div className="p-4 rounded-2xl bg-[#0B1220] border border-[#22324C] space-y-2.5 text-xs text-[#94A3B8]">
-                <h4 className="text-sm font-bold text-white">Pasos manuales según tu navegador</h4>
+                <h4 className="text-sm font-bold text-white">Cómo instalar manualmente</h4>
                 <div className="space-y-1.5 leading-relaxed">
                   <p>
-                    <strong className="text-[#00CFE8]">Android (Chrome / Edge):</strong> Abre{' '}
-                    <code className="text-white">https://proyecto-vel.netlify.app</code>, toca el menú{' '}
+                    <strong className="text-[#00CFE8]">Android (Chrome / Edge):</strong> Abre esta misma dirección en tu navegador, toca el menú{' '}
                     <strong className="text-white">⋮</strong> y selecciona{' '}
                     <strong className="text-white">«Instalar aplicación»</strong> o{' '}
                     <strong className="text-white">«Agregar a la pantalla principal»</strong>.
                   </p>
                   <p>
-                    <strong className="text-[#10B981]">iPhone / iPad (Safari):</strong> Abre el dominio oficial en Safari, pulsa{' '}
+                    <strong className="text-[#10B981]">iPhone / iPad (Safari):</strong> Abre VEL en Safari, pulsa{' '}
                     <strong className="text-white">Compartir</strong> y luego{' '}
                     <strong className="text-white">«Agregar a inicio»</strong>.
                   </p>
                 </div>
                 <div className="p-2.5 rounded-xl bg-[#111C2E] border border-[#22324C] text-[11px] leading-snug">
-                  <strong className="text-white">Importante:</strong> Blogger actúa exclusivamente como página institucional y de contratación. El Service Worker y la aplicación instalable viven en el dominio Netlify oficial. No se requiere descargar ningún APK ni archivo ZIP para instalar VEL en tus teléfonos.
+                  <strong className="text-white">Nota:</strong> No hace falta buscar ni instalar archivos externos para usar VEL en tus teléfonos.
                 </div>
               </div>
             </div>

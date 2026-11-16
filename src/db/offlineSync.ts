@@ -1,33 +1,48 @@
 // src/db/offlineSync.ts
-import { velDb, VelLocalRecord } from './db';
+import { arrayBufferToBase64, base64ToUint8Array } from '../crypto/deviceCrypto';
+import { toExactArrayBuffer } from '../crypto/fileHash';
+import { velDb, VelLocalRecord, VelStorageAdapter } from './db';
 
 /**
  * Gestor de almacenamiento local cifrado en reposo para VEL CORE.
  * Garantiza la soberanía local de los datos sin utilizar localStorage para claves ni datos personales.
  */
 
-const LOCAL_VAULT_KEY_CONFIG = 'local_vault_aes_key';
+export const LOCAL_VAULT_KEY_CONFIG = 'local_vault_aes_key';
 let cachedCryptoKey: CryptoKey | null = null;
 
-async function getOrCreateLocalKey(): Promise<CryptoKey> {
-  if (cachedCryptoKey) return cachedCryptoKey;
+export function resetLocalVaultKeyCache(): void {
+  cachedCryptoKey = null;
+}
 
-  const existingKey = await velDb.getConfig<CryptoKey>(LOCAL_VAULT_KEY_CONFIG);
+export async function getOrCreateLocalVaultKey(
+  storage: Pick<VelStorageAdapter, 'getConfig' | 'setConfig'> = velDb
+): Promise<CryptoKey> {
+  const useSharedCache = storage === velDb;
+  if (useSharedCache && cachedCryptoKey) {
+    return cachedCryptoKey;
+  }
+
+  const existingKey = await storage.getConfig<CryptoKey>(LOCAL_VAULT_KEY_CONFIG);
   if (existingKey && existingKey.type === 'secret') {
-    cachedCryptoKey = existingKey;
+    if (useSharedCache) {
+      cachedCryptoKey = existingKey;
+    }
     return existingKey;
   }
 
   // Clave AES-256-GCM generada con Web Crypto API como CryptoKey NO exportable
   // y persistida directamente en IndexedDB (sin localStorage).
-  const generatedKey = await crypto.subtle.generateKey(
+  const generatedKey = await globalThis.crypto.subtle.generateKey(
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
   );
 
-  await velDb.setConfig(LOCAL_VAULT_KEY_CONFIG, generatedKey);
-  cachedCryptoKey = generatedKey;
+  await storage.setConfig(LOCAL_VAULT_KEY_CONFIG, generatedKey);
+  if (useSharedCache) {
+    cachedCryptoKey = generatedKey;
+  }
   return generatedKey;
 }
 
@@ -36,19 +51,19 @@ export class VelOfflineSyncManager {
    * Guarda un registro cifrado localmente en IndexedDB respetando la soberanía de datos.
    */
   async saveLocal(id: string, data: object | string): Promise<VelLocalRecord> {
-    const key = await getOrCreateLocalKey();
-    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await getOrCreateLocalVaultKey(velDb);
+    const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
     const plaintext = typeof data === 'string' ? data : JSON.stringify(data);
     const encoded = new TextEncoder().encode(plaintext);
 
-    const ciphertextBuffer = await crypto.subtle.encrypt(
+    const ciphertextBuffer = await globalThis.crypto.subtle.encrypt(
       { name: 'AES-GCM', iv: iv as BufferSource },
       key,
       encoded as BufferSource
     );
 
-    const ciphertextBase64 = btoa(String.fromCharCode(...new Uint8Array(ciphertextBuffer)));
-    const ivBase64 = btoa(String.fromCharCode(...iv));
+    const ciphertextBase64 = arrayBufferToBase64(ciphertextBuffer);
+    const ivBase64 = arrayBufferToBase64(toExactArrayBuffer(iv));
 
     const record: VelLocalRecord = {
       id,
@@ -69,14 +84,14 @@ export class VelOfflineSyncManager {
     if (!record) return null;
 
     try {
-      const key = await getOrCreateLocalKey();
-      const iv = Uint8Array.from(atob(record.iv), c => c.charCodeAt(0));
-      const ciphertext = Uint8Array.from(atob(record.encryptedData), c => c.charCodeAt(0));
+      const key = await getOrCreateLocalVaultKey(velDb);
+      const iv = base64ToUint8Array(record.iv);
+      const ciphertext = base64ToUint8Array(record.encryptedData);
 
-      const decryptedBuffer = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: iv as BufferSource },
+      const decryptedBuffer = await globalThis.crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: toExactArrayBuffer(iv) as BufferSource },
         key,
-        ciphertext as BufferSource
+        toExactArrayBuffer(ciphertext) as BufferSource
       );
 
       const text = new TextDecoder().decode(decryptedBuffer);

@@ -12,8 +12,11 @@ import {
 } from '../contracts/velContracts';
 import {
   computePairingSasCode,
+  decryptE2EEBytes,
   decryptE2EEPayload,
   deriveSharedE2EESessionKey,
+  E2EEBinaryAadMetadata,
+  encryptE2EEBytes,
   encryptE2EEPayload,
   generateEphemeralPairingCode,
   signRelayAuthChallenge
@@ -65,6 +68,70 @@ export interface RevokeOutcome {
   error?: string;
 }
 
+export type BinaryFileEnvelopePurpose = NonNullable<E2EEBinaryAadMetadata['purpose']>;
+
+export interface IncomingBinaryFilePacket {
+  operationId: string;
+  senderId: string;
+  recipientId: string;
+  sessionId: string;
+  timestamp: number;
+  fileId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  purpose: BinaryFileEnvelopePurpose;
+  plaintextBytes: Uint8Array;
+}
+
+export type BinaryFilePacketHandler = (packet: IncomingBinaryFilePacket) => Promise<boolean>;
+
+export interface BinaryFileEnvelopeSendResult {
+  confirmed: boolean;
+  operationId: string;
+  reason?: string;
+  error?: string;
+}
+
+const FILE_CHANNEL_OP_PREFIX = 'VELF|';
+const MAX_SEEN_INCOMING_OP_IDS = 4000;
+
+export function buildBinaryFileOperationId(
+  purpose: BinaryFileEnvelopePurpose,
+  fileId: string,
+  chunkIndex: number,
+  totalChunks: number
+): string {
+  const code = purpose === 'FILE_CHUNK' ? 'C' : purpose === 'FILE_MANIFEST' ? 'M' : 'K';
+  const nonce = createRandomUuid().replace(/-/g, '').slice(0, 12);
+  return `${FILE_CHANNEL_OP_PREFIX}${code}|${fileId}|${chunkIndex}|${totalChunks}|${nonce}`;
+}
+
+export function parseBinaryFileOperationId(operationId: string): {
+  purpose: BinaryFileEnvelopePurpose;
+  fileId: string;
+  chunkIndex: number;
+  totalChunks: number;
+} | null {
+  if (!operationId.startsWith(FILE_CHANNEL_OP_PREFIX)) {
+    return null;
+  }
+  const parts = operationId.split('|');
+  if (parts.length !== 6) {
+    return null;
+  }
+  const [, code, fileId, idxStr, totalStr, nonce] = parts;
+  if (!fileId || !nonce) return null;
+  const purpose: BinaryFileEnvelopePurpose | null =
+    code === 'C' ? 'FILE_CHUNK' : code === 'M' ? 'FILE_MANIFEST' : code === 'K' ? 'FILE_CONTROL' : null;
+  if (!purpose) return null;
+  const chunkIndex = Number(idxStr);
+  const totalChunks = Number(totalStr);
+  if (!Number.isInteger(chunkIndex) || !Number.isInteger(totalChunks) || totalChunks < 1 || chunkIndex < 0 || chunkIndex >= totalChunks) {
+    return null;
+  }
+  return { purpose, fileId, chunkIndex, totalChunks };
+}
+
 function createRandomUuid(): string {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
     return globalThis.crypto.randomUUID();
@@ -74,6 +141,13 @@ function createRandomUuid(): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
+}
+
+function resolveBoundFetch(customFetch?: typeof fetch): typeof fetch {
+  if (!customFetch || (typeof globalThis !== 'undefined' && customFetch === globalThis.fetch)) {
+    return (...args: Parameters<typeof fetch>) => globalThis.fetch(...args);
+  }
+  return (...args: Parameters<typeof fetch>) => customFetch(...args);
 }
 
 export class VelRelayClient implements RelayClientContract {
@@ -107,6 +181,12 @@ export class VelRelayClient implements RelayClientContract {
   private revocationDetail: string | null = null;
   private isConnectingGuard = false;
   private pendingRevokeResolver: ((res: RevokeOutcome) => void) | null = null;
+  private filePacketHandler: BinaryFilePacketHandler | null = null;
+  private pendingFileAckWaiters = new Map<
+    string,
+    { resolve: (res: BinaryFileEnvelopeSendResult) => void; timer: ReturnType<typeof setTimeout> }
+  >();
+  private connectionLostListeners = new Set<(reason: string) => void>();
 
   private stateListeners = new Set<(state: RelayConnectionState) => void>();
   private snapshotListeners = new Set<(snapshot: RelayClientSnapshot) => void>();
@@ -114,7 +194,7 @@ export class VelRelayClient implements RelayClientContract {
   constructor(options: VelRelayClientOptions = {}) {
     this.storage = options.storage || velDb;
     this.tokenProvider = options.getFirebaseIdToken || getFreshDeviceAuthToken;
-    this.fetchFn = options.fetchFn || fetch;
+    this.fetchFn = resolveBoundFetch(options.fetchFn);
     this.WebSocketCtor = options.WebSocketImpl || (typeof WebSocket !== 'undefined' ? WebSocket : null);
     this.operationAckTimeoutMs = options.operationAckTimeoutMs ?? 10_000;
     this.reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? 1_000;
@@ -183,6 +263,48 @@ export class VelRelayClient implements RelayClientContract {
       clearTimeout(timer);
     }
     this.ackTimers.clear();
+  }
+
+  private recordSeenIncomingOperationId(operationId: string): void {
+    this.seenIncomingOperationIds.add(operationId);
+    if (this.seenIncomingOperationIds.size > MAX_SEEN_INCOMING_OP_IDS) {
+      const excess = this.seenIncomingOperationIds.size - MAX_SEEN_INCOMING_OP_IDS;
+      let removed = 0;
+      for (const key of this.seenIncomingOperationIds) {
+        this.seenIncomingOperationIds.delete(key);
+        removed++;
+        if (removed >= excess) break;
+      }
+    }
+  }
+
+  private abortPendingFileTransfers(reason: string): void {
+    for (const [opId, waiter] of this.pendingFileAckWaiters.entries()) {
+      clearTimeout(waiter.timer);
+      this.pendingFileAckWaiters.delete(opId);
+      waiter.resolve({
+        confirmed: false,
+        operationId: opId,
+        reason,
+        error: `Transferencia interrumpida (${reason}).`
+      });
+    }
+    for (const listener of this.connectionLostListeners) {
+      try {
+        listener(reason);
+      } catch {
+        // Ignorar errores de listeners
+      }
+    }
+  }
+
+  public setFilePacketHandler(handler: BinaryFilePacketHandler | null): void {
+    this.filePacketHandler = handler;
+  }
+
+  public onConnectionLost(listener: (reason: string) => void): () => void {
+    this.connectionLostListeners.add(listener);
+    return () => this.connectionLostListeners.delete(listener);
   }
 
   public connect(wssUrl: string, firebaseIdTokenProvider?: () => Promise<string | null>): void {
@@ -312,6 +434,7 @@ export class VelRelayClient implements RelayClientContract {
 
         this.ws = null;
         this.peerOnline = false;
+        this.abortPendingFileTransfers(code === 4003 ? 'DEVICE_REVOKED' : 'RELAY_DISCONNECTED');
 
         if (this.manualDisconnect) {
           this.setState('DISCONNECTED');
@@ -378,6 +501,7 @@ export class VelRelayClient implements RelayClientContract {
     this.manualDisconnect = true;
     this.clearReconnectTimer();
     this.clearAllAckTimers();
+    this.abortPendingFileTransfers('MANUAL_DISCONNECT');
     this.peerOnline = false;
     this.sessionKey = null;
     this.receivedMessages = [];
@@ -548,6 +672,9 @@ export class VelRelayClient implements RelayClientContract {
           msg.peerDeviceId === this.currentIdentity.pairedPeerDeviceId
         ) {
           this.peerOnline = Boolean(msg.online);
+          if (!this.peerOnline) {
+            this.abortPendingFileTransfers('RECIPIENT_OFFLINE');
+          }
           this.emit();
         }
         return;
@@ -707,6 +834,22 @@ export class VelRelayClient implements RelayClientContract {
       case 'DELIVERY_FAILED': {
         const opId = String(msg.operationId || '');
         this.clearAckTimer(opId);
+        const fileWaiter = this.pendingFileAckWaiters.get(opId);
+        if (fileWaiter) {
+          clearTimeout(fileWaiter.timer);
+          this.pendingFileAckWaiters.delete(opId);
+          if (msg.reason === 'RECIPIENT_OFFLINE') {
+            this.peerOnline = false;
+          }
+          fileWaiter.resolve({
+            confirmed: false,
+            operationId: opId,
+            reason: String(msg.reason || 'DELIVERY_FAILED'),
+            error: String(msg.message || 'Entrega fallida: destinatario sin conexión.')
+          });
+          this.emit();
+          return;
+        }
         const op = this.operations.find((o) => o.operationId === opId);
         if (op) {
           op.status = 'FAILED';
@@ -734,7 +877,7 @@ export class VelRelayClient implements RelayClientContract {
           // Protección anti-replay: ignorar duplicado
           return;
         }
-        this.seenIncomingOperationIds.add(operationId);
+        this.recordSeenIncomingOperationId(operationId);
 
         if (
           !this.sessionKey ||
@@ -751,6 +894,68 @@ export class VelRelayClient implements RelayClientContract {
             status: 'REJECTED',
             timestamp: Date.now()
           });
+          return;
+        }
+
+        // Canal binario cifrado de archivos (Etapa 2): NO contamina receivedMessages ni confirma antes de persistir
+        const fileOpMeta = parseBinaryFileOperationId(operationId);
+        if (fileOpMeta) {
+          try {
+            const plaintextBytes = await decryptE2EEBytes(this.sessionKey, iv, ciphertext, {
+              sessionId,
+              senderId,
+              recipientId,
+              operationId,
+              timestamp,
+              fileId: fileOpMeta.fileId,
+              chunkIndex: fileOpMeta.chunkIndex,
+              totalChunks: fileOpMeta.totalChunks,
+              purpose: fileOpMeta.purpose
+            });
+
+            if (!this.filePacketHandler) {
+              this.sendConfirmation({
+                type: 'CONFIRMATION',
+                senderId: this.currentIdentity.deviceId,
+                recipientId: senderId,
+                operationId,
+                status: 'REJECTED',
+                timestamp: Date.now()
+              });
+              return;
+            }
+
+            const accepted = await this.filePacketHandler({
+              operationId,
+              senderId,
+              recipientId,
+              sessionId,
+              timestamp,
+              fileId: fileOpMeta.fileId,
+              chunkIndex: fileOpMeta.chunkIndex,
+              totalChunks: fileOpMeta.totalChunks,
+              purpose: fileOpMeta.purpose,
+              plaintextBytes
+            });
+
+            this.sendConfirmation({
+              type: 'CONFIRMATION',
+              senderId: this.currentIdentity.deviceId,
+              recipientId: senderId,
+              operationId,
+              status: accepted ? 'CONFIRMED' : 'REJECTED',
+              timestamp: Date.now()
+            });
+          } catch {
+            this.sendConfirmation({
+              type: 'CONFIRMATION',
+              senderId: this.currentIdentity.deviceId,
+              recipientId: senderId,
+              operationId,
+              status: 'REJECTED',
+              timestamp: Date.now()
+            });
+          }
           return;
         }
 
@@ -827,6 +1032,25 @@ export class VelRelayClient implements RelayClientContract {
       case 'CONFIRMATION': {
         const opId = String(msg.operationId || '');
         this.clearAckTimer(opId);
+        const fileWaiter = this.pendingFileAckWaiters.get(opId);
+        if (fileWaiter) {
+          clearTimeout(fileWaiter.timer);
+          this.pendingFileAckWaiters.delete(opId);
+          if (msg.status === 'REJECTED') {
+            fileWaiter.resolve({
+              confirmed: false,
+              operationId: opId,
+              reason: 'RECIPIENT_REJECTED',
+              error: 'El dispositivo destinatario rechazó el bloque o su integridad.'
+            });
+          } else {
+            fileWaiter.resolve({
+              confirmed: true,
+              operationId: opId
+            });
+          }
+          return;
+        }
         const op = this.operations.find((o) => o.operationId === opId && o.direction === 'OUTGOING');
         if (op) {
           if (msg.status === 'REJECTED') {
@@ -849,6 +1073,7 @@ export class VelRelayClient implements RelayClientContract {
         this.receivedMessages = [];
         this.peerOnline = false;
         this.clearReconnectTimer();
+        this.abortPendingFileTransfers('DEVICE_REVOKED');
         this.lastRevocationMessage = String(
           msg.message || 'Tu autorización fue revocada permanentemente por VEL CORE.'
         );
@@ -917,6 +1142,18 @@ export class VelRelayClient implements RelayClientContract {
         const opId = msg.operationId ? String(msg.operationId) : null;
         if (opId) {
           this.clearAckTimer(opId);
+          const fileWaiter = this.pendingFileAckWaiters.get(opId);
+          if (fileWaiter) {
+            clearTimeout(fileWaiter.timer);
+            this.pendingFileAckWaiters.delete(opId);
+            fileWaiter.resolve({
+              confirmed: false,
+              operationId: opId,
+              reason: String(msg.error || 'RELAY_ERROR'),
+              error: String(msg.message || msg.error || 'Error reportado por el Relay.')
+            });
+            return;
+          }
           const op = this.operations.find((o) => o.operationId === opId);
           if (op) {
             op.status = 'FAILED';
@@ -1210,6 +1447,119 @@ export class VelRelayClient implements RelayClientContract {
       }
       this.emit();
       return { accepted: false, operationId, error: err?.message || 'Error cifrando paquete.' };
+    }
+  }
+
+  /**
+   * Cifra un bloque o mensaje de control del canal de archivos con encryptE2EEBytes (AES-256-GCM + AAD),
+   * lo envía por el Relay y espera la confirmación real del dispositivo destinatario.
+   * Nunca confirma únicamente por enrutado ni guarda archivos en cola offline.
+   */
+  public async sendBinaryFileEnvelope(params: {
+    fileId: string;
+    chunkIndex: number;
+    totalChunks: number;
+    purpose: BinaryFileEnvelopePurpose;
+    payloadBytes: Uint8Array | ArrayBuffer;
+    timeoutMs?: number;
+  }): Promise<BinaryFileEnvelopeSendResult> {
+    const operationId = buildBinaryFileOperationId(
+      params.purpose,
+      params.fileId,
+      params.chunkIndex,
+      params.totalChunks
+    );
+
+    if (
+      this.state !== 'LINKED' ||
+      !this.sessionKey ||
+      !this.currentIdentity?.activeLinkId ||
+      !this.currentIdentity?.pairedPeerDeviceId ||
+      !this.ws ||
+      this.ws.readyState !== 1
+    ) {
+      return {
+        confirmed: false,
+        operationId,
+        reason: 'OFFLINE_OR_UNLINKED',
+        error: 'Sin conexión cifrada activa con el dispositivo par.'
+      };
+    }
+
+    const now = Date.now();
+    const senderId = this.currentIdentity.deviceId;
+    const recipientId = this.currentIdentity.pairedPeerDeviceId;
+    const sessionId = this.currentIdentity.activeLinkId;
+
+    try {
+      const { ivBase64, ciphertextBase64 } = await encryptE2EEBytes(
+        this.sessionKey,
+        params.payloadBytes,
+        {
+          sessionId,
+          senderId,
+          recipientId,
+          operationId,
+          timestamp: now,
+          fileId: params.fileId,
+          chunkIndex: params.chunkIndex,
+          totalChunks: params.totalChunks,
+          purpose: params.purpose
+        }
+      );
+
+      const ackPromise = new Promise<BinaryFileEnvelopeSendResult>((resolve) => {
+        const timeout = setTimeout(() => {
+          this.pendingFileAckWaiters.delete(operationId);
+          resolve({
+            confirmed: false,
+            operationId,
+            reason: 'ACK_TIMEOUT',
+            error: 'Tiempo agotado esperando confirmación real desde VEL CORE.'
+          });
+        }, params.timeoutMs ?? Math.max(this.operationAckTimeoutMs, 15_000));
+
+        this.pendingFileAckWaiters.set(operationId, { resolve, timer: timeout });
+      });
+
+      const sent = this.sendEncryptedEnvelope({
+        type: 'ENCRYPTED_MESSAGE',
+        senderId,
+        recipientId,
+        sessionId,
+        operationId,
+        iv: ivBase64,
+        ciphertext: ciphertextBase64,
+        timestamp: now
+      });
+
+      if (!sent) {
+        const waiter = this.pendingFileAckWaiters.get(operationId);
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          this.pendingFileAckWaiters.delete(operationId);
+        }
+        return {
+          confirmed: false,
+          operationId,
+          reason: 'WS_SEND_FAILED',
+          error: 'La conexión WebSocket se cerró durante el envío.'
+        };
+      }
+
+      return await ackPromise;
+    } catch (err: any) {
+      const waiter = this.pendingFileAckWaiters.get(operationId);
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        this.pendingFileAckWaiters.delete(operationId);
+      }
+      return {
+        confirmed: false,
+        operationId,
+        reason: 'ENCRYPT_OR_SEND_ERROR',
+        error: err?.message || 'Error cifrando o enviando el bloque E2EE.'
+      };
     }
   }
 

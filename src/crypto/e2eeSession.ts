@@ -200,6 +200,126 @@ export async function decryptE2EEPayload(
   return new TextDecoder().decode(decrypted);
 }
 
+export interface E2EEBinaryAadMetadata extends E2EEEnvelopeMetadata {
+  fileId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  purpose?: 'FILE_CHUNK' | 'FILE_MANIFEST' | 'FILE_CONTROL';
+}
+
+export interface EncryptedBinaryPayload {
+  iv: Uint8Array;
+  ciphertext: ArrayBuffer;
+  ivBase64: string;
+  ciphertextBase64: string;
+}
+
+function normalizeBinaryBuffer(input: Uint8Array | ArrayBuffer | string, label: string): Uint8Array {
+  if (typeof input === 'string') {
+    return base64ToUint8Array(input);
+  }
+  if (input instanceof Uint8Array) {
+    return input;
+  }
+  if (input instanceof ArrayBuffer) {
+    return new Uint8Array(input);
+  }
+  throw new Error(`Formato binario inválido para ${label}.`);
+}
+
+function toSubArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength && bytes.buffer instanceof ArrayBuffer) {
+    return bytes.buffer;
+  }
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function buildBinaryEnvelopeAad(meta: E2EEBinaryAadMetadata): Uint8Array {
+  if (!meta.sessionId?.trim() || !meta.senderId?.trim() || !meta.recipientId?.trim() || !meta.operationId?.trim()) {
+    throw new Error('Metadatos E2EE incompletos para construir AAD binario.');
+  }
+  if (!meta.fileId?.trim()) {
+    throw new Error('fileId es obligatorio en AAD binario.');
+  }
+  if (!Number.isInteger(meta.totalChunks) || meta.totalChunks < 1) {
+    throw new Error(`totalChunks inválido en AAD binario: ${meta.totalChunks}`);
+  }
+  if (!Number.isInteger(meta.chunkIndex) || meta.chunkIndex < 0 || meta.chunkIndex >= meta.totalChunks) {
+    throw new Error(`chunkIndex inválido en AAD binario: ${meta.chunkIndex}/${meta.totalChunks}`);
+  }
+  const purpose = meta.purpose || 'FILE_CHUNK';
+  const aadText = `VEL-BIN-AAD-v1|${purpose}|${meta.sessionId}|${meta.senderId}|${meta.recipientId}|${meta.operationId}|${meta.timestamp}|${meta.fileId}|${meta.chunkIndex}|${meta.totalChunks}`;
+  return new TextEncoder().encode(aadText);
+}
+
+/**
+ * Cifra un bloque binario E2EE con AES-256-GCM usando la clave de sesión existente,
+ * IV aleatorio de 96 bits (12 bytes) y AAD vinculado al bloque concreto.
+ */
+export async function encryptE2EEBytes(
+  sessionKey: CryptoKey,
+  plaintextBytes: Uint8Array | ArrayBuffer,
+  meta: E2EEBinaryAadMetadata
+): Promise<EncryptedBinaryPayload> {
+  const subtle = getSubtle();
+  const iv = new Uint8Array(12);
+  globalThis.crypto.getRandomValues(iv);
+
+  const plainView = plaintextBytes instanceof Uint8Array ? plaintextBytes : new Uint8Array(plaintextBytes);
+  const aad = buildBinaryEnvelopeAad(meta);
+
+  const encrypted = await subtle.encrypt(
+    {
+      name: 'AES-GCM',
+      iv,
+      additionalData: toSubArrayBuffer(aad),
+      tagLength: 128
+    },
+    sessionKey,
+    toSubArrayBuffer(plainView)
+  );
+
+  return {
+    iv,
+    ciphertext: encrypted,
+    ivBase64: arrayBufferToBase64(toSubArrayBuffer(iv)),
+    ciphertextBase64: arrayBufferToBase64(encrypted)
+  };
+}
+
+/**
+ * Descifra y verifica integridad/autenticidad AEAD+AAD de un bloque binario E2EE.
+ * Falla si cambia cualquier byte del ciphertext, IV o cualquiera de los identificadores del bloque en AAD.
+ */
+export async function decryptE2EEBytes(
+  sessionKey: CryptoKey,
+  ivInput: Uint8Array | ArrayBuffer | string,
+  ciphertextInput: Uint8Array | ArrayBuffer | string,
+  meta: E2EEBinaryAadMetadata
+): Promise<Uint8Array> {
+  const subtle = getSubtle();
+  const iv = normalizeBinaryBuffer(ivInput, 'IV');
+  if (iv.length !== 12) {
+    throw new Error('IV inválido en bloque binario cifrado AES-GCM (se requieren 12 bytes).');
+  }
+
+  const ciphertext = normalizeBinaryBuffer(ciphertextInput, 'ciphertext');
+  const aad = buildBinaryEnvelopeAad(meta);
+
+  const decrypted = await subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: toSubArrayBuffer(iv),
+      additionalData: toSubArrayBuffer(aad),
+      tagLength: 128
+    },
+    sessionKey,
+    toSubArrayBuffer(ciphertext)
+  );
+
+  return new Uint8Array(decrypted);
+}
+
 /**
  * Firma el desafío emitido por el Relay WebSocket para demostrar posesión física
  * de la clave privada ECDSA P-256 registrada en Firestore.

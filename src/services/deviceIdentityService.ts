@@ -48,6 +48,13 @@ export interface DeviceIdentityDeps {
   fetchFn?: typeof fetch;
 }
 
+function resolveBoundFetch(customFetch?: typeof fetch): typeof fetch {
+  if (!customFetch || (typeof globalThis !== 'undefined' && customFetch === globalThis.fetch)) {
+    return (...args: Parameters<typeof fetch>) => globalThis.fetch(...args);
+  }
+  return (...args: Parameters<typeof fetch>) => customFetch(...args);
+}
+
 export function toIdentitySummary(record: LocalDeviceIdentityRecord): DeviceIdentitySummary {
   return {
     deviceId: record.deviceId,
@@ -101,7 +108,7 @@ export async function setupNewDeviceIdentity(
 ): Promise<DeviceSetupResult> {
   const storage = deps.storage || velDb;
   const ensureAuth = deps.ensureAnonymousAuth || ensureDeviceAnonymousSession;
-  const fetchFn = deps.fetchFn || fetch;
+  const fetchFn = resolveBoundFetch(deps.fetchFn);
 
   const steps: SetupProgressStep[] = [
     { step: 'storage', status: 'in_progress', detail: 'Preparando almacenamiento local seguro (IndexedDB)...' },
@@ -214,10 +221,11 @@ async function registerLocalIdentityOnServer(
   idToken: string,
   steps?: SetupProgressStep[],
   onProgress?: (steps: SetupProgressStep[]) => void,
-  deps: { storage: VelStorageAdapter; fetchFn: typeof fetch } = { storage: velDb, fetchFn: fetch }
+  deps: { storage: VelStorageAdapter; fetchFn?: typeof fetch } = { storage: velDb }
 ): Promise<DeviceSetupResult> {
+  const safeFetch = resolveBoundFetch(deps.fetchFn);
   try {
-    const response = await deps.fetchFn('/api/register-device', {
+    const response = await safeFetch('/api/register-device', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -335,7 +343,7 @@ export async function retryPendingDeviceRegistration(
 ): Promise<DeviceSetupResult> {
   const storage = deps.storage || velDb;
   const ensureAuth = deps.ensureAnonymousAuth || ensureDeviceAnonymousSession;
-  const fetchFn = deps.fetchFn || fetch;
+  const fetchFn = resolveBoundFetch(deps.fetchFn);
 
   const existing = await storage.getIdentity();
   if (!existing) {
@@ -388,7 +396,7 @@ export async function syncPersistedDeviceSession(
   const storage = deps.storage || velDb;
   const ensureAuth = deps.ensureAnonymousAuth || ensureDeviceAnonymousSession;
   const getToken = deps.getFreshToken || getFreshDeviceAuthToken;
-  const fetchFn = deps.fetchFn || fetch;
+  const fetchFn = resolveBoundFetch(deps.fetchFn);
 
   const existing = await storage.getIdentity();
   if (!existing) return null;
@@ -490,7 +498,7 @@ export async function executeControlledRoleChange(
   const getToken = deps.getFreshToken || getFreshDeviceAuthToken;
   const ensureAuth = deps.ensureAnonymousAuth || ensureDeviceAnonymousSession;
   const signOutFn = deps.signOutAnonymous || signOutDeviceAuth;
-  const fetchFn = deps.fetchFn || fetch;
+  const fetchFn = resolveBoundFetch(deps.fetchFn);
 
   const existing = await storage.getIdentity();
   if (existing && existing.registrationStatus !== 'pending_local') {
