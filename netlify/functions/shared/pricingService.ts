@@ -1,5 +1,5 @@
 import type { Firestore, DocumentSnapshot } from 'firebase-admin/firestore';
-import { getAdminDb } from './firebaseAdmin';
+import { getAdminDb, hasFirebaseAdminCredentials } from './firebaseAdmin';
 import { PricingConfig, PricingHistoryEntry } from './types';
 
 const PRICING_DOC_PATH = 'configuracion_comercial/precios';
@@ -38,10 +38,17 @@ export function isValidCurrencyCode(currency: string): boolean {
  * Nunca sustituye silenciosamente con DEFAULT_PRICING si falla la lectura o falta configuración.
  */
 export async function getCurrentPricing(dbOverride?: Firestore): Promise<PricingConfig> {
-  const db = dbOverride || getAdminDb();
+  if (!dbOverride && !hasFirebaseAdminCredentials()) {
+    throw new PricingUnavailableError(
+      'Credenciales de Firebase Admin no configuradas en el servidor para consultar la tarifa vigente.',
+      'not_configured'
+    );
+  }
+
   let docSnap: DocumentSnapshot;
 
   try {
+    const db = dbOverride || getAdminDb();
     docSnap = await db.doc(PRICING_DOC_PATH).get();
   } catch (err: any) {
     throw new PricingUnavailableError(
@@ -205,8 +212,11 @@ export async function getPricingHistory(
   limitCount: number = 20,
   dbOverride?: Firestore
 ): Promise<PricingHistoryEntry[]> {
-  const db = dbOverride || getAdminDb();
   try {
+    if (!dbOverride && !hasFirebaseAdminCredentials()) {
+      return [];
+    }
+    const db = dbOverride || getAdminDb();
     const snap = await db
       .collection(PRICING_HISTORY_COLLECTION)
       .orderBy('actualizadoEl', 'desc')
