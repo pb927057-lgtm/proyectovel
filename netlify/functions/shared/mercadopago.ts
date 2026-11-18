@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 const MP_BASE_URL = 'https://api.mercadopago.com';
 
 export function getMpAccessToken(): string {
-  const token = process.env.MP_ACCESS_TOKEN || '';
+  const token = process.env.MP_ACCESS_TOKEN || process.env.MERCADOPAGO_ACCESS_TOKEN || '';
   if (!token) {
     console.warn('Advertencia: MP_ACCESS_TOKEN pendiente de configuración en variables de entorno.');
   }
