@@ -2,7 +2,7 @@
 // PROHIBIDO: No almacenar respuestas de API, tokens, mensajes, claves ni datos personales.
 // Los datos personales residen cifrados exclusivamente en el IndexedDB local de VEL CORE.
 
-const CACHE_NAME = 'vel-static-cache-v3';
+const CACHE_NAME = 'vel-static-cache-v4';
 
 // Activos estáticos esenciales de la interfaz
 const PRECACHE_ASSETS = [
@@ -24,8 +24,31 @@ function isSensitiveOrDynamicPath(pathname) {
   );
 }
 
+function isViteDevModulePath(pathname, search) {
+  return (
+    pathname.startsWith('/src/') ||
+    pathname.startsWith('/@') ||
+    pathname.startsWith('/node_modules/') ||
+    (typeof search === 'string' && search.includes('t='))
+  );
+}
+
+function isPreviewOrDevHost(hostname) {
+  const normalized = (hostname || '').toLowerCase();
+  return (
+    normalized === 'localhost' ||
+    normalized === '127.0.0.1' ||
+    normalized === '[::1]' ||
+    /^ais-(dev|pre)-.*\.run\.app$/i.test(normalized) ||
+    normalized.endsWith('.scf.usercontent.goog')
+  );
+}
+
 self.addEventListener('install', (event) => {
   self.skipWaiting();
+  if (isPreviewOrDevHost(self.location.hostname)) {
+    return;
+  }
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(PRECACHE_ASSETS).catch((err) => {
@@ -36,6 +59,22 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener('activate', (event) => {
+  if (isPreviewOrDevHost(self.location.hostname)) {
+    event.waitUntil(
+      caches
+        .keys()
+        .then((cacheNames) =>
+          Promise.all(
+            cacheNames
+              .filter((name) => /^vel-static-cache-/i.test(name))
+              .map((name) => caches.delete(name))
+          )
+        )
+        .then(() => self.registration.unregister().catch(() => false))
+    );
+    return;
+  }
+
   event.waitUntil(
     caches
       .keys()
@@ -57,6 +96,10 @@ self.addEventListener('message', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
+  if (isPreviewOrDevHost(self.location.hostname)) {
+    return;
+  }
+
   const request = event.request;
 
   if (request.method !== 'GET') {
@@ -72,6 +115,11 @@ self.addEventListener('fetch', (event) => {
 
   // Nunca interceptar orígenes externos (Firebase, Mercado Pago, Blogger, WSS)
   if (url.origin !== self.location.origin) {
+    return;
+  }
+
+  // Nunca interceptar ni cachear módulos de desarrollo Vite (Preview)
+  if (isViteDevModulePath(url.pathname, url.search)) {
     return;
   }
 

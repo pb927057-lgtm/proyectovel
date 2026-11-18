@@ -53,16 +53,24 @@ export function getAuthErrorMessage(errorCode: string): string {
       return 'Por favor ingresa tu correo electrónico.';
     case 'auth/operation-not-allowed':
     case 'auth/admin-restricted-operation':
-      return 'Este método de acceso sin contraseña aún no está habilitado en Firebase Authentication Console.';
+    case 'auth/configuration-not-found':
+      return 'El proveedor de acceso técnico (Anonymous Authentication) no está habilitado o configurado en Firebase Console.';
     case 'auth/unauthorized-continue-uri':
     case 'auth/invalid-continue-uri':
+    case 'auth/unauthorized-domain':
       return 'El dominio actual no está autorizado en Firebase Authentication (Authorized domains).';
+    case 'auth/api-key-not-valid':
+    case 'auth/invalid-api-key':
+    case 'auth/app-not-authorized':
+      return 'La configuración de Firebase Web App (API key / proyecto) no es válida o no está autorizada.';
     case 'auth/expired-action-code':
       return 'El enlace de verificación de un solo uso ha expirado. Solicita un nuevo enlace.';
     case 'auth/invalid-action-code':
       return 'El enlace de verificación ya fue utilizado o no es válido. Solicita uno nuevo.';
     default:
-      return 'Ocurrió un error al validar la identidad en Firebase Authentication.';
+      return errorCode
+        ? `Ocurrió un error al validar la identidad en Firebase Authentication (${errorCode}).`
+        : 'Ocurrió un error al validar la identidad en Firebase Authentication.';
   }
 }
 
@@ -81,6 +89,13 @@ export interface DeviceAnonymousAuthResult {
  */
 export async function ensureDeviceAnonymousSession(): Promise<DeviceAnonymousAuthResult> {
   try {
+    if (typeof (deviceAuth as any).authStateReady === 'function') {
+      try {
+        await (deviceAuth as any).authStateReady();
+      } catch {
+        // Continuar evaluando currentUser si authStateReady falla transitoriamente
+      }
+    }
     let user = deviceAuth.currentUser;
     if (!user) {
       const credential = await signInAnonymously(deviceAuth);
@@ -95,13 +110,15 @@ export async function ensureDeviceAnonymousSession(): Promise<DeviceAnonymousAut
   } catch (err: any) {
     const code = String(err?.code || '');
     const providerDisabled =
-      code === 'auth/operation-not-allowed' || code === 'auth/admin-restricted-operation';
+      code === 'auth/operation-not-allowed' ||
+      code === 'auth/admin-restricted-operation' ||
+      code === 'auth/configuration-not-found';
     return {
       success: false,
       providerDisabled,
       errorCode: code || 'unknown',
       errorMessage: providerDisabled
-        ? 'Firebase Anonymous Authentication no está habilitado en Firebase Console para proyecto-vel.'
+        ? `Firebase Anonymous Authentication no está habilitado en Firebase Console para proyecto-vel (${code}).`
         : getAuthErrorMessage(code)
     };
   }
@@ -152,7 +169,7 @@ export async function sendPasswordlessSignInLink(email: string, continueUrl?: st
     continueUrl ||
     (typeof window !== 'undefined'
       ? `${window.location.origin}${window.location.pathname}`
-      : 'https://proyecto-vel.netlify.app/');
+      : 'https://legendary-pasca-bf280b.netlify.app/');
 
   await sendSignInLinkToEmail(auth, cleanEmail, {
     url: targetUrl,

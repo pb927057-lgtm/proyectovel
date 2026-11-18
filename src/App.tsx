@@ -11,11 +11,7 @@ import {
   Info,
   ChevronRight,
   ExternalLink,
-  Ban,
-  User,
   Download,
-  CreditCard,
-  Check,
   HelpCircle,
   Radio,
   FileText,
@@ -50,29 +46,9 @@ import {
   setupNewDeviceIdentity,
   syncPersistedDeviceSession
 } from './services/deviceIdentityService';
-import {
-  clearPendingEmailForLink,
-  completePasswordlessSignInLink,
-  getAuthErrorMessage,
-  getFreshDeviceAuthToken,
-  isIncomingPasswordlessSignInLink,
-  logoutUser,
-  sendPasswordlessSignInLink,
-  subscribeToAuthChanges,
-  User as FirebaseUser
-} from './services/firebase';
+import { getFreshDeviceAuthToken } from './services/firebase';
 import { RelayClientSnapshot, VelRelayClient } from './services/relayClient';
-import {
-  AceptacionContratoDocument,
-  ensureSubscriberDocument,
-  getContractAcceptance,
-  getSubscriberDocument,
-  isTechnicalAccount,
-  recordContractAcceptance,
-  SuscriptorDocument,
-  OFFICIAL_CONTRACT_URL,
-  CURRENT_CONTRACT_VERSION
-} from './services/firestore';
+import { OFFICIAL_CONTRACT_URL } from './services/firestore';
 import { velOfflineSync } from './db/offlineSync';
 import type { VelLocalRecord } from './db/db';
 import { useOnlineStatus, usePWAInstall } from './hooks/usePWAInstall';
@@ -105,8 +81,8 @@ export type ScreenType =
 export type { DeviceRole };
 
 export function App() {
-  // Modos de vista: PWA VEL (Dispositivo), Portal Web (Contratación) e Instalación
-  const [viewMode, setViewMode] = useState<'PHONE_PREVIEW' | 'WEB_PORTAL' | 'INSTALL_INFO'>('PHONE_PREVIEW');
+  // Modos de vista: PWA VEL (Dispositivo) e Instalación
+  const [viewMode, setViewMode] = useState<'PHONE_PREVIEW' | 'INSTALL_INFO'>('PHONE_PREVIEW');
   const [currentScreen, setCurrentScreen] = useState<ScreenType>('WELCOME');
   const [screenHistory, setScreenHistory] = useState<ScreenType[]>([]);
 
@@ -186,6 +162,7 @@ export function App() {
   const goHome = () => {
     setViewMode('PHONE_PREVIEW');
     setScreenHistory([]);
+    setRegistrationFeedback(null);
     setCurrentScreen('WELCOME');
   };
 
@@ -197,6 +174,11 @@ export function App() {
   const [setupError, setSetupError] = useState<string | null>(null);
   const [requiresExternalConfig, setRequiresExternalConfig] = useState(false);
   const [isRetryingSync, setIsRetryingSync] = useState(false);
+  const [registrationFeedback, setRegistrationFeedback] = useState<{
+    type: 'success' | 'error';
+    message: string;
+    requiresConfig?: boolean;
+  } | null>(null);
 
   const isActiveRegisteredCore = Boolean(
     deviceIdentity &&
@@ -206,10 +188,43 @@ export function App() {
   );
 
   useEffect(() => {
-    if (!isLoadingIdentity && currentScreen === 'EXPLAIN_CORE' && isActiveRegisteredCore) {
+    if (isLoadingIdentity) return;
+
+    if (!deviceIdentity) {
+      if (
+        currentScreen === 'CORE_HOME' ||
+        currentScreen === 'TERMINAL_HOME' ||
+        currentScreen === 'PAIRING_CORE' ||
+        currentScreen === 'DEVICE_MANAGEMENT' ||
+        currentScreen === 'REPLACE_PHONE' ||
+        currentScreen === 'SECOND_PHONE_GUIDE'
+      ) {
+        setCurrentScreen('WELCOME');
+      }
+      return;
+    }
+
+    if (currentScreen === 'EXPLAIN_CORE' && isActiveRegisteredCore) {
+      setCurrentScreen('CORE_HOME');
+      return;
+    }
+
+    if (
+      deviceIdentity.role === 'TERMINAL' &&
+      (currentScreen === 'CORE_HOME' ||
+        currentScreen === 'PAIRING_CORE' ||
+        currentScreen === 'DEVICE_MANAGEMENT' ||
+        currentScreen === 'REPLACE_PHONE' ||
+        currentScreen === 'SECOND_PHONE_GUIDE')
+    ) {
+      setCurrentScreen('TERMINAL_HOME');
+      return;
+    }
+
+    if (deviceIdentity.role === 'CORE' && currentScreen === 'TERMINAL_HOME') {
       setCurrentScreen('CORE_HOME');
     }
-  }, [isLoadingIdentity, currentScreen, isActiveRegisteredCore]);
+  }, [isLoadingIdentity, currentScreen, deviceIdentity, isActiveRegisteredCore]);
 
   // PWA & Conectividad
   const pwa = usePWAInstall();
@@ -720,13 +735,27 @@ export function App() {
   const handleApplySetupOutcome = (result: DeviceSetupResult) => {
     if (result.identity) {
       setDeviceIdentity(result.identity);
+      setSetupSteps(buildCompletedStepsForExisting(result.identity));
     }
     if (!result.success) {
-      setSetupError(result.error || 'No se pudo completar el registro en la nube.');
+      const errMsg = result.error || 'No se pudo completar el registro en la nube.';
+      setSetupError(errMsg);
       setRequiresExternalConfig(Boolean(result.requiresExternalConfig));
+      setRegistrationFeedback({
+        type: 'error',
+        message: errMsg,
+        requiresConfig: Boolean(result.requiresExternalConfig)
+      });
     } else {
       setSetupError(null);
       setRequiresExternalConfig(false);
+      setRegistrationFeedback({
+        type: 'success',
+        message:
+          result.identity?.role === 'CORE'
+            ? 'VEL CORE registrado correctamente en la nube. Ya puedes continuar con la vinculación de tu teléfono MÓVIL.'
+            : 'VEL MÓVIL registrado correctamente en la nube. Ya puedes vincularlo con tu VEL CORE.'
+      });
     }
   };
 
@@ -747,6 +776,7 @@ export function App() {
   const handleStartDeviceSetup = async (role: DeviceRole) => {
     setSetupError(null);
     setRequiresExternalConfig(false);
+    setRegistrationFeedback(null);
 
     // Si este dispositivo ya tiene una identidad guardada, conservarla intacta sin regenerar nada
     if (deviceIdentity) {
@@ -773,20 +803,26 @@ export function App() {
       });
       handleApplySetupOutcome(result);
     } catch (err: any) {
-      setSetupError(err?.message || 'Error inesperado al configurar este teléfono.');
+      const errMsg = err?.message || 'Error inesperado al configurar este teléfono.';
+      setSetupError(errMsg);
+      setRegistrationFeedback({ type: 'error', message: errMsg });
     } finally {
       setIsSettingUpDevice(false);
     }
   };
 
   const handleRetryServerRegistration = async () => {
+    if (isRetryingSync) return;
     setIsRetryingSync(true);
     setSetupError(null);
+    setRegistrationFeedback(null);
     try {
       const result = await retryPendingDeviceRegistration();
       handleApplySetupOutcome(result);
     } catch (err: any) {
-      setSetupError(err?.message || 'Error al reintentar el registro en la nube.');
+      const errMsg = err?.message || 'Error al reintentar el registro en la nube.';
+      setSetupError(errMsg);
+      setRegistrationFeedback({ type: 'error', message: errMsg });
     } finally {
       setIsRetryingSync(false);
     }
@@ -831,6 +867,7 @@ export function App() {
       setSetupSteps([]);
       setSetupError(null);
       setRequiresExternalConfig(false);
+      setRegistrationFeedback(null);
       setPairingCodeInput('');
       setRevokeFeedback(null);
       setRoleChangeConfirmInput('');
@@ -844,283 +881,39 @@ export function App() {
     }
   };
 
-  // ==========================================
-  // ESTADO DEL PORTAL WEB: CONTRATACIÓN Y SUSCRIPCIÓN (SIN CONTRASEÑA)
-  // ==========================================
-  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
-  const [authEmail, setAuthEmail] = useState('');
-  const [authError, setAuthError] = useState<string | null>(null);
-  const [authSuccess, setAuthSuccess] = useState<string | null>(null);
-  const [emailLinkSentTo, setEmailLinkSentTo] = useState<string | null>(null);
-  const [needsLinkEmailConfirm, setNeedsLinkEmailConfirm] = useState(false);
-  const [confirmLinkEmailInput, setConfirmLinkEmailInput] = useState('');
-  const [isSubmittingAuth, setIsSubmittingAuth] = useState(false);
-  const [subscriberDoc, setSubscriberDoc] = useState<SuscriptorDocument | null>(null);
-
-  // Aceptación obligatoria del contrato en Portal Web (persistida realmente en Firestore)
-  const [webContractAccepted, setWebContractAccepted] = useState(false);
-  const [contractAcceptanceDoc, setContractAcceptanceDoc] = useState<AceptacionContratoDocument | null>(null);
-  const [isRecordingContract, setIsRecordingContract] = useState(false);
-  const [contractError, setContractError] = useState<string | null>(null);
-
-  // Retorno desde Mercado Pago (?pago_retorno=aprobado|pendiente|cancelado)
-  const [paymentReturnStatus, setPaymentReturnStatus] = useState<'aprobado' | 'pendiente' | 'cancelado' | null>(null);
-  const [isRefreshingSubscription, setIsRefreshingSubscription] = useState(false);
-
-  // Estados comerciales de Mercado Pago y Precios
-  const [serverPricing, setServerPricing] = useState<{ monto: number; moneda: string; periodicidad: string }>({
-    monto: 4500,
-    moneda: 'ARS',
-    periodicidad: 'mensual'
-  });
-  const [isStartingCheckout, setIsStartingCheckout] = useState(false);
-  const [checkoutError, setCheckoutError] = useState<string | null>(null);
-  const [isCancellingSub, setIsCancellingSub] = useState(false);
-  const [cancelMessage, setCancelMessage] = useState<string | null>(null);
-
-  // Panel de administración de precios
-  const [showAdminPanel, setShowAdminPanel] = useState(false);
-  const [adminNewPrice, setAdminNewPrice] = useState('4500');
-  const [adminNewCurrency, setAdminNewCurrency] = useState('ARS');
-  const [adminPriceMsg, setAdminPriceMsg] = useState<string | null>(null);
-  const [adminHistory, setAdminHistory] = useState<any[]>([]);
-
-  const isAdmin = currentUser?.email && ['admin@vel.com', 'soporte@vel.com', 'pb927057@gmail.com'].includes(currentUser.email.toLowerCase());
-
-  // Cargar precio vigente desde el servidor
-  useEffect(() => {
-    fetch('/api/get-pricing')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (data?.pricing) {
-          setServerPricing(data.pricing);
-          setAdminNewPrice(String(data.pricing.monto));
-          setAdminNewCurrency(data.pricing.moneda);
-        }
-      })
-      .catch(() => {
-        // Fallback predeterminado ya configurado
-      });
-  }, []);
-
-  const loadAdminHistory = async () => {
-    if (!currentUser) return;
-    try {
-      const idToken = await currentUser.getIdToken();
-      const res = await fetch('/api/admin-pricing', {
-        headers: { Authorization: `Bearer ${idToken}` }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setAdminHistory(data.history || []);
-      }
-    } catch {
-      // Manejo silencioso
-    }
-  };
-
-  const handleStartCheckout = async () => {
-    if (!currentUser) {
-      setCheckoutError('Debes registrar tu cuenta o iniciar sesión antes de contratar.');
-      return;
-    }
-
-    const isExistingSubscriber = Boolean(
-      subscriberDoc?.precioContratado &&
-        subscriberDoc.precioContratado > 0 &&
-        (subscriberDoc.fechaUltimoPago ||
-          subscriberDoc.venceEl ||
-          ['activo', 'en_gracia', 'suspendido', 'vencido'].includes(subscriberDoc.estado))
-    );
-
-    if (!isExistingSubscriber) {
-      if (!webContractAccepted) {
-        setCheckoutError('Debes aceptar obligatoriamente los Términos y Condiciones antes de continuar.');
-        return;
-      }
-
-      // Verificar que la aceptación legal esté efectivamente persistida en Firestore antes de abrir Checkout Pro
-      if (!contractAcceptanceDoc?.aceptado || contractAcceptanceDoc.versionContrato !== CURRENT_CONTRACT_VERSION) {
-        setIsRecordingContract(true);
-        setContractError(null);
-        const acceptanceRes = await recordContractAcceptance(
-          currentUser.uid,
-          CURRENT_CONTRACT_VERSION,
-          OFFICIAL_CONTRACT_URL,
-          currentUser.email
-        );
-        setIsRecordingContract(false);
-        if (!acceptanceRes.success || !acceptanceRes.doc) {
-          const msg =
-            acceptanceRes.error ||
-            'No se pudo confirmar el registro legal de tu aceptación en Firestore. Intenta nuevamente.';
-          setContractError(msg);
-          setWebContractAccepted(false);
-          setCheckoutError(msg);
-          return;
-        }
-        setContractAcceptanceDoc(acceptanceRes.doc);
-      }
-    }
-
-    setIsStartingCheckout(true);
-    setCheckoutError(null);
-    setCancelMessage(null);
-
-    try {
-      const idToken = await currentUser.getIdToken(true);
-      const res = await fetch('/api/create-preference', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`
-        },
-        body: JSON.stringify({})
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'No se pudo generar la preferencia de pago en Mercado Pago.');
-      }
-
-      if (data.pendingConfig || data.isConfigPending) {
-        setCheckoutError(data.error || data.mensaje || 'Credenciales pendientes de configuración en Netlify.');
-      } else if (typeof data.init_point === 'string' && data.init_point.startsWith('https://')) {
-        window.location.href = data.init_point;
-      } else {
-        throw new Error('Mercado Pago no retornó una URL de pago válida (init_point).');
-      }
-    } catch (err: any) {
-      setCheckoutError(err.message || 'Error al conectar con la pasarela de pago.');
-    } finally {
-      setIsStartingCheckout(false);
-    }
-  };
-
-  const [isCheckingDownload, setIsCheckingDownload] = useState(false);
-
-  const handleAuthorizedDownload = async () => {
-    if (!currentUser) {
-      setCheckoutError('Debes iniciar sesión para descargar el paquete autorizado.');
-      return;
-    }
-    setIsCheckingDownload(true);
-    setCheckoutError(null);
-
-    try {
-      const idToken = await currentUser.getIdToken(true);
-      const res = await fetch('/api/download-package?format=json', {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${idToken}`,
-          Accept: 'application/json'
-        }
-      });
-
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.authorized || !data.downloadUrl) {
-        const refreshed = await getSubscriberDocument(currentUser.uid).catch(() => null);
-        if (refreshed) setSubscriberDoc(refreshed);
-        throw new Error(data.error || 'Descarga no autorizada para el estado actual de tu suscripción.');
-      }
-
-      const link = document.createElement('a');
-      link.href = data.downloadUrl;
-      link.download = 'vel-netlify-actualizacion.zip';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    } catch (err: any) {
-      setCheckoutError(err.message || 'No se pudo validar la autorización de descarga.');
-    } finally {
-      setIsCheckingDownload(false);
-    }
-  };
-
-  const handleCancelSubscription = async () => {
-    if (!currentUser) return;
-    setIsCancellingSub(true);
-    setCancelMessage(null);
-    setCheckoutError(null);
-
-    try {
-      const idToken = await currentUser.getIdToken();
-      const res = await fetch('/api/cancel-subscription', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`
-        }
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Fallo al procesar la cancelación.');
-      }
-
-      setCancelMessage(data.mensaje || 'Suscripción cancelada exitosamente.');
-      const docSnap = await getSubscriberDocument(currentUser.uid);
-      setSubscriberDoc(docSnap);
-    } catch (err: any) {
-      setCheckoutError(err.message || 'Error al cancelar la suscripción.');
-    } finally {
-      setIsCancellingSub(false);
-    }
-  };
-
-  const handleUpdatePriceAdmin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!currentUser) return;
-    setAdminPriceMsg(null);
-
-    const num = Number(adminNewPrice);
-    if (isNaN(num) || num <= 0) {
-      setAdminPriceMsg('El monto debe ser mayor a 0.');
-      return;
-    }
-
-    try {
-      const idToken = await currentUser.getIdToken();
-      const res = await fetch('/api/admin-pricing', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`
-        },
-        body: JSON.stringify({
-          monto: num,
-          moneda: adminNewCurrency,
-          motivoCambio: 'Actualización comercial desde el panel administrativo'
-        })
-      });
-
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Error al actualizar');
-
-      setAdminPriceMsg(`✓ ${data.mensaje}`);
-      if (data.pricing) {
-        setServerPricing(data.pricing);
-      }
-      loadAdminHistory();
-    } catch (err: any) {
-      setAdminPriceMsg(`Error: ${err.message}`);
-    }
-  };
 
   // Restaurar identidad técnica persistida (IndexedDB) y completar posible retorno de Email Link
   useEffect(() => {
     let active = true;
 
+    const readPersistedIdentityWithGuard = async () => {
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      try {
+        return await Promise.race([
+          loadPersistedDeviceIdentity(),
+          new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => {
+              reject(new Error('Tiempo de espera agotado al leer la configuración local en IndexedDB.'));
+            }, 3000);
+          })
+        ]);
+      } finally {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+      }
+    };
+
     const bootstrapApp = async () => {
       try {
-        const persisted = await loadPersistedDeviceIdentity();
+        const persisted = await readPersistedIdentityWithGuard();
         if (!active) return;
 
-        if (persisted) {
+        if (persisted && (persisted.role === 'CORE' || persisted.role === 'TERMINAL')) {
           setDeviceIdentity(persisted);
           setSetupSteps(buildCompletedStepsForExisting(persisted));
-          setCurrentScreen(persisted.role === 'CORE' ? 'CORE_HOME' : 'TERMINAL_HOME');
+          setScreenHistory([]);
+          setCurrentScreen('WELCOME');
           setIsLoadingIdentity(false);
 
           // Sincronización silenciosa en segundo plano contra Firestore (/api/device-session)
@@ -1128,68 +921,45 @@ export function App() {
             .then((syncRes) => {
               if (!active || !syncRes) return;
               setDeviceIdentity(syncRes.identity);
+              setSetupSteps(buildCompletedStepsForExisting(syncRes.identity));
               if (!syncRes.synced && syncRes.error) {
                 setSetupError(syncRes.error);
+                if (syncRes.requiresExternalConfig) {
+                  setRequiresExternalConfig(true);
+                }
               } else {
                 setSetupError(null);
+                setRequiresExternalConfig(false);
               }
             })
             .catch(() => {
               // Mantiene la identidad persistida localmente sin interrumpir el inicio
             });
         } else {
+          setDeviceIdentity(null);
+          setScreenHistory([]);
           setCurrentScreen('WELCOME');
           setIsLoadingIdentity(false);
         }
       } catch (err: any) {
         if (!active) return;
         setSetupError(err?.message || 'Error al cargar la configuración local.');
+        setDeviceIdentity(null);
+        setScreenHistory([]);
         setCurrentScreen('WELCOME');
         setIsLoadingIdentity(false);
       }
 
-      // Detectar retorno desde Mercado Pago (?pago_retorno=aprobado|pendiente|cancelado) o parámetro ?vista=portal
-      if (typeof window !== 'undefined' && window.location.search) {
-        const params = new URLSearchParams(window.location.search);
-        const pagoRetorno = params.get('pago_retorno');
-        const vista = params.get('vista');
-        if (pagoRetorno === 'aprobado' || pagoRetorno === 'pendiente' || pagoRetorno === 'cancelado') {
-          setPaymentReturnStatus(pagoRetorno);
-          setViewMode('WEB_PORTAL');
-          if (!isIncomingPasswordlessSignInLink() && window.history?.replaceState) {
-            window.history.replaceState({}, document.title, window.location.pathname);
+      // Detectar parámetro ?vista=instalar para abrir la vista de instalación PWA
+      try {
+        if (typeof window !== 'undefined' && window.location.search) {
+          const params = new URLSearchParams(window.location.search);
+          if (params.get('vista') === 'instalar') {
+            setViewMode('INSTALL_INFO');
           }
-        } else if (vista === 'portal') {
-          setViewMode('WEB_PORTAL');
-        } else if (vista === 'instalar') {
-          setViewMode('INSTALL_INFO');
         }
-      }
-
-      // Verificar si la URL corresponde a un enlace de acceso comercial sin contraseña (Email Link)
-      if (isIncomingPasswordlessSignInLink()) {
-        setViewMode('WEB_PORTAL');
-        setIsSubmittingAuth(true);
-        const linkRes = await completePasswordlessSignInLink();
-        if (!active) return;
-        setIsSubmittingAuth(false);
-
-        if (linkRes.completed && linkRes.user) {
-          setAuthSuccess(`✓ Identidad verificada sin contraseña: ${linkRes.user.email}`);
-          setNeedsLinkEmailConfirm(false);
-          setEmailLinkSentTo(null);
-          await ensureSubscriberDocument(linkRes.user.uid, linkRes.user.email || '');
-          const docSnap = await getSubscriberDocument(linkRes.user.uid).catch(() => null);
-          if (active) setSubscriberDoc(docSnap);
-          if (typeof window !== 'undefined' && window.history?.replaceState) {
-            window.history.replaceState({}, document.title, window.location.pathname);
-          }
-        } else if (linkRes.needsEmailConfirmation) {
-          setNeedsLinkEmailConfirm(true);
-          setAuthError(linkRes.error || 'Ingresa tu correo para completar la verificación del enlace.');
-        } else if (linkRes.error) {
-          setAuthError(linkRes.error);
-        }
+      } catch {
+        // No interrumpir la pantalla inicial ante parámetros de URL no válidos
       }
     };
 
@@ -1199,244 +969,6 @@ export function App() {
     };
   }, []);
 
-  useEffect(() => {
-    const unsubscribe = subscribeToAuthChanges(async (user) => {
-      setCurrentUser(user);
-      setAuthLoading(false);
-      if (user) {
-        try {
-          const docSnap = await getSubscriberDocument(user.uid);
-          setSubscriberDoc(docSnap);
-          try {
-            const acceptanceSnap = await getContractAcceptance(user.uid, CURRENT_CONTRACT_VERSION);
-            if (acceptanceSnap?.aceptado) {
-              setWebContractAccepted(true);
-              setContractAcceptanceDoc(acceptanceSnap);
-              setContractError(null);
-            } else {
-              setWebContractAccepted(false);
-              setContractAcceptanceDoc(null);
-            }
-          } catch (contractErr: any) {
-            setWebContractAccepted(false);
-            setContractAcceptanceDoc(null);
-            setContractError(
-              contractErr?.message ||
-                'No se pudo verificar el estado previo de aceptación del contrato en Firestore.'
-            );
-          }
-        } catch {
-          // Manejo silencioso de carga inicial del perfil comercial
-        }
-      } else {
-        setSubscriberDoc(null);
-        setWebContractAccepted(false);
-        setContractAcceptanceDoc(null);
-        setContractError(null);
-      }
-    });
-    return () => unsubscribe();
-  }, []);
-
-  const handleRequestPasswordlessLink = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    setAuthError(null);
-    setAuthSuccess(null);
-
-    const email = authEmail.trim();
-    if (!email) {
-      setAuthError('Falta ingresar tu correo electrónico. Es necesario para enviarte el enlace único de acceso sin contraseña.');
-      return;
-    }
-    if (!email.includes('@')) {
-      setAuthError('El correo electrónico ingresado no parece válido. Revisa el formato (por ejemplo, nombre@correo.com).');
-      return;
-    }
-
-    setIsSubmittingAuth(true);
-    try {
-      await sendPasswordlessSignInLink(email);
-      setEmailLinkSentTo(email);
-      setAuthSuccess(
-        `✓ Enlace de acceso único enviado a ${email}. Abre tu bandeja y haz clic en el enlace para ingresar sin contraseña (si ya eras suscriptor, se conservará tu historial y tarifa).`
-      );
-    } catch (err: any) {
-      setAuthError(getAuthErrorMessage(err?.code || ''));
-    } finally {
-      setIsSubmittingAuth(false);
-    }
-  };
-
-  const handleConfirmEmailForLink = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError(null);
-    setAuthSuccess(null);
-
-    const email = confirmLinkEmailInput.trim();
-    if (!email || !email.includes('@')) {
-      setAuthError('Falta confirmar un correo electrónico válido. Debe coincidir con el correo donde recibiste el enlace.');
-      return;
-    }
-
-    setIsSubmittingAuth(true);
-    try {
-      const res = await completePasswordlessSignInLink(email);
-      if (res.completed && res.user) {
-        setNeedsLinkEmailConfirm(false);
-        setConfirmLinkEmailInput('');
-        setAuthSuccess(`✓ Identidad verificada sin contraseña: ${res.user.email}`);
-        await ensureSubscriberDocument(res.user.uid, res.user.email || '');
-        const docSnap = await getSubscriberDocument(res.user.uid).catch(() => null);
-        setSubscriberDoc(docSnap);
-        if (typeof window !== 'undefined' && window.history?.replaceState) {
-          window.history.replaceState({}, document.title, window.location.pathname);
-        }
-      } else {
-        setAuthError(res.error || 'No se pudo validar el enlace con ese correo electrónico.');
-      }
-    } finally {
-      setIsSubmittingAuth(false);
-    }
-  };
-
-  const handleWebLogout = async () => {
-    await logoutUser();
-    await clearPendingEmailForLink();
-    setSubscriberDoc(null);
-    setAuthSuccess(null);
-    setAuthError(null);
-    setEmailLinkSentTo(null);
-    setNeedsLinkEmailConfirm(false);
-  };
-
-  const handleContractCheckboxChange = async (checked: boolean) => {
-    setContractError(null);
-    setCheckoutError(null);
-
-    if (!checked) {
-      if (contractAcceptanceDoc?.aceptado) {
-        setWebContractAccepted(true);
-        return;
-      }
-      setWebContractAccepted(false);
-      return;
-    }
-
-    if (!currentUser) {
-      setWebContractAccepted(false);
-      setContractError('Debes iniciar sesión sin contraseña en el Paso 1 antes de registrar la aceptación del contrato.');
-      return;
-    }
-
-    if (isTechnicalAccount(currentUser.uid, currentUser.email)) {
-      setWebContractAccepted(false);
-      setContractError('Operación bloqueada: la cuenta técnica o de soporte no puede registrarse como cliente particular.');
-      return;
-    }
-
-    // Evitar registro duplicado si la versión actual ya fue aceptada y persistida
-    if (
-      contractAcceptanceDoc?.aceptado &&
-      contractAcceptanceDoc.versionContrato === CURRENT_CONTRACT_VERSION
-    ) {
-      setWebContractAccepted(true);
-      return;
-    }
-
-    setIsRecordingContract(true);
-    try {
-      const res = await recordContractAcceptance(
-        currentUser.uid,
-        CURRENT_CONTRACT_VERSION,
-        OFFICIAL_CONTRACT_URL,
-        currentUser.email
-      );
-      if (!res.success || !res.doc) {
-        setWebContractAccepted(false);
-        setContractAcceptanceDoc(null);
-        setContractError(
-          res.error || 'No se pudo registrar tu aceptación legal en Cloud Firestore. Intenta nuevamente.'
-        );
-        return;
-      }
-      setContractAcceptanceDoc(res.doc);
-      setWebContractAccepted(true);
-    } catch (err: any) {
-      setWebContractAccepted(false);
-      setContractAcceptanceDoc(null);
-      setContractError(err?.message || 'Error inesperado al guardar la aceptación del contrato.');
-    } finally {
-      setIsRecordingContract(false);
-    }
-  };
-
-  const handleRefreshSubscriptionFromFirestore = async () => {
-    if (!currentUser) return;
-    setIsRefreshingSubscription(true);
-    try {
-      const fresh = await getSubscriberDocument(currentUser.uid);
-      setSubscriberDoc(fresh);
-    } catch {
-      setCheckoutError('No se pudo consultar tu estado comercial actual en Cloud Firestore.');
-    } finally {
-      setIsRefreshingSubscription(false);
-    }
-  };
-
-  const commercialStatusBadge = (() => {
-    if (!currentUser) {
-      return {
-        label: 'Sin sesión comercial abierta',
-        cls: 'bg-[#94A3B8]/15 text-[#94A3B8] border-[#94A3B8]/30'
-      };
-    }
-    const est = subscriberDoc?.estado;
-    const venceMs = subscriberDoc?.venceEl ? Date.parse(subscriberDoc.venceEl) : NaN;
-    const isExpiredDate = !Number.isNaN(venceMs) && venceMs <= Date.now();
-    if (est === 'activo' && !isExpiredDate) {
-      const daysLeft = !Number.isNaN(venceMs)
-        ? Math.ceil((venceMs - Date.now()) / (24 * 60 * 60 * 1000))
-        : null;
-      if (daysLeft !== null && daysLeft <= 7) {
-        return {
-          label: `Próxima a vencer (${daysLeft} d)`,
-          cls: 'bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/30'
-        };
-      }
-      return {
-        label: 'Activa',
-        cls: 'bg-[#10B981]/15 text-[#10B981] border-[#10B981]/30'
-      };
-    }
-    if (est === 'en_gracia') {
-      return {
-        label: 'Período de gracia (7 días)',
-        cls: 'bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/30'
-      };
-    }
-    if (est === 'vencido' || (est === 'activo' && isExpiredDate)) {
-      return {
-        label: 'Vencida',
-        cls: 'bg-[#EF4444]/15 text-[#EF4444] border-[#EF4444]/30'
-      };
-    }
-    if (est === 'suspendido') {
-      return {
-        label: 'Suspendida',
-        cls: 'bg-[#EF4444]/15 text-[#EF4444] border-[#EF4444]/30'
-      };
-    }
-    if (est === 'cancelado') {
-      return {
-        label: 'Cancelada',
-        cls: 'bg-[#94A3B8]/15 text-[#94A3B8] border-[#94A3B8]/30'
-      };
-    }
-    return {
-      label: 'Sin suscripción activa',
-      cls: 'bg-[#94A3B8]/15 text-[#94A3B8] border-[#94A3B8]/30'
-    };
-  })();
 
   const registrationBadge = (() => {
     switch (deviceIdentity?.registrationStatus) {
@@ -1488,18 +1020,6 @@ export function App() {
             <span className="sm:hidden">VEL</span>
           </button>
 
-          <button
-            onClick={() => setViewMode('WEB_PORTAL')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
-              viewMode === 'WEB_PORTAL'
-                ? 'bg-[#00CFE8] text-[#0B1220] font-bold shadow-md'
-                : 'text-[#94A3B8] hover:text-white bg-[#18263E]'
-            }`}
-          >
-            <CreditCard className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Contratar</span>
-            <span className="sm:hidden">Contratar</span>
-          </button>
 
           <button
             onClick={() => setViewMode('INSTALL_INFO')}
@@ -1572,31 +1092,40 @@ export function App() {
                 {/* 1. PANTALLA: BIENVENIDA PRINCIPAL VEL */}
                 {/* ============================================== */}
                 {!isLoadingIdentity && currentScreen === 'WELCOME' && (
-                  <div className="flex-1 px-4 py-3.5 flex flex-col justify-between space-y-3 overflow-y-auto">
-                    <div className="space-y-3">
+                  <div className="flex-1 px-4 py-2 flex flex-col justify-between space-y-2 overflow-y-auto">
+                    <div className="space-y-2">
                       {/* Encabezado: Logo Oficial + Bienvenida + Presentación */}
-                      <div className="flex flex-col items-center text-center space-y-2 pt-0.5">
-                        <div className="w-12 h-12 rounded-2xl bg-[#111C2E] border border-[#22324C] flex items-center justify-center shadow-lg">
-                          <svg className="w-8 h-8" viewBox="0 0 100 100" fill="none">
+                      <div className="flex flex-col items-center text-center space-y-1.5">
+                        <div className="w-10 h-10 rounded-2xl bg-[#111C2E] border border-[#22324C] flex items-center justify-center shadow-lg">
+                          <svg className="w-7 h-7" viewBox="0 0 100 100" fill="none">
                             <path d="M50 15L85 85H70L50 45L30 85H15L50 15Z" fill="#00CFE8" />
                             <circle cx="50" cy="35" r="5" fill="#FFFFFF" />
                           </svg>
                         </div>
 
-                        <div className="space-y-1">
-                          <h1 className="text-lg font-extrabold tracking-tight text-white">
+                        <div className="space-y-0.5">
+                          <h1 className="text-base font-extrabold tracking-tight text-white">
                             BIENVENIDO A VEL
                           </h1>
-                          <p className="text-[11px] text-[#E2E8F0] leading-relaxed px-1">
+                          <p className="text-[10.5px] text-[#E2E8F0] leading-snug px-1">
                             VEL te permite proteger tu información personal mediante dos teléfonos con funciones complementarias: uno conserva tus datos resguardados y el otro los utiliza de forma segura cada día.
                           </p>
                         </div>
                       </div>
 
-                      {/* Acceso rápido si este teléfono ya está configurado como VEL MÓVIL */}
+                      {/* Aviso si este teléfono ya está configurado como VEL CORE */}
+                      {deviceIdentity && deviceIdentity.role === 'CORE' && (
+                        <div className="p-2 rounded-2xl bg-[#111C2E] border border-[#00CFE8]/35">
+                          <div className="flex items-center justify-center gap-1.5 text-[10.5px] text-[#CBD5E1]">
+                            <CheckCircle className="w-3.5 h-3.5 shrink-0 text-[#00CFE8]" />
+                            <span>Este teléfono ya está configurado como VEL CORE.</span>
+                          </div>
+                        </div>
+                      )}
+
                       {deviceIdentity && deviceIdentity.role === 'TERMINAL' && (
-                        <div className="p-2.5 rounded-2xl bg-[#111C2E] border border-[#10B981]/35 space-y-2">
-                          <div className="flex items-center justify-center gap-1.5 text-[11px] text-[#CBD5E1]">
+                        <div className="p-2 rounded-2xl bg-[#111C2E] border border-[#10B981]/35 space-y-1.5">
+                          <div className="flex items-center justify-center gap-1.5 text-[10.5px] text-[#CBD5E1]">
                             <CheckCircle className="w-3.5 h-3.5 shrink-0 text-[#10B981]" />
                             <span>Este teléfono ya está configurado como VEL MÓVIL.</span>
                           </div>
@@ -1604,45 +1133,45 @@ export function App() {
                           <button
                             type="button"
                             onClick={() => navigateTo('TERMINAL_HOME')}
-                            className="w-full h-9 rounded-xl font-extrabold text-xs tracking-wide transition-all shadow cursor-pointer flex items-center justify-center gap-2 bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220]"
+                            className="w-full h-8 rounded-xl font-extrabold text-[11px] tracking-wide transition-all shadow cursor-pointer flex items-center justify-center gap-2 bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220]"
                           >
-                            <Smartphone className="w-4 h-4" />
+                            <Smartphone className="w-3.5 h-3.5" />
                             <span>IR A MI PANEL VEL MÓVIL</span>
                           </button>
                         </div>
                       )}
 
                       {/* Cómo funciona VEL */}
-                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-2">
-                        <span className="text-[10px] font-extrabold tracking-wide text-[#00CFE8] block leading-snug">
+                      <div className="p-2.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-1.5">
+                        <span className="text-[9.5px] font-extrabold tracking-wide text-[#00CFE8] block leading-snug">
                           VEL FUNCIONA CON DOS TELÉFONOS Y SE DEBE DESCARGAR EN CADA TELÉFONO LA APP VEL.
                         </span>
 
-                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#00CFE8]/25 space-y-0.5">
-                          <span className="text-[11px] font-bold text-white block">
+                        <div className="p-2 rounded-xl bg-[#0B1220] border border-[#00CFE8]/25 space-y-0.5">
+                          <span className="text-[10.5px] font-bold text-white block">
                             VEL CORE — Teléfono principal
                           </span>
-                          <p className="text-[11px] text-[#CBD5E1] leading-snug">
+                          <p className="text-[10.5px] text-[#CBD5E1] leading-snug">
                             Es el dispositivo que conserva y protege la información personal cifrada localmente.
                           </p>
                         </div>
 
-                        <div className="p-2.5 rounded-xl bg-[#0B1220] border border-[#10B981]/25 space-y-0.5">
-                          <span className="text-[11px] font-bold text-white block">
+                        <div className="p-2 rounded-xl bg-[#0B1220] border border-[#10B981]/25 space-y-0.5">
+                          <span className="text-[10.5px] font-bold text-white block">
                             VEL MÓVIL — Teléfono de uso diario
                           </span>
-                          <p className="text-[11px] text-[#CBD5E1] leading-snug">
+                          <p className="text-[10.5px] text-[#CBD5E1] leading-snug">
                             Permite utilizar la información protegida por CORE mediante una conexión segura, sin conservar copias personales.
                           </p>
                         </div>
                       </div>
 
                       {/* Instrucciones antes de elegir el dispositivo */}
-                      <div className="p-3 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-1.5">
-                        <span className="text-[10px] font-extrabold tracking-wide text-white block leading-snug">
+                      <div className="p-2.5 rounded-2xl bg-[#111C2E] border border-[#22324C] space-y-1">
+                        <span className="text-[9.5px] font-extrabold tracking-wide text-white block leading-snug">
                           PRIMERO, IDENTIFICA QUÉ TELÉFONO VAS A CONFIGURAR
                         </span>
-                        <ul className="space-y-1 text-[11px] text-[#CBD5E1] leading-snug list-disc list-inside">
+                        <ul className="space-y-0.5 text-[10.5px] text-[#CBD5E1] leading-snug list-disc list-inside">
                           <li>
                             Si este es tu teléfono principal, selecciona <strong className="text-[#00CFE8]">VEL CORE</strong> y realiza su configuración.
                           </li>
@@ -1650,43 +1179,33 @@ export function App() {
                             Si este es tu teléfono de uso diario, selecciona <strong className="text-[#10B981]">VEL MÓVIL</strong> y sigue las instrucciones para vincularlo con el teléfono CORE.
                           </li>
                         </ul>
-                        <p className="text-[10px] text-[#94A3B8] leading-snug pt-0.5">
+                        <p className="text-[9.5px] text-[#94A3B8] leading-snug">
                           Primero debe configurarse <strong className="text-white">VEL CORE</strong> en tu teléfono principal y posteriormente vincularse <strong className="text-white">VEL MÓVIL</strong> desde un segundo teléfono.
                         </p>
                       </div>
 
-                      {/* Dos opciones independientes de selección de dispositivo */}
-                      <div className="space-y-2.5">
+                      {/* Dos opciones independientes de selección de dispositivo (orden: CORE primero, luego MÓVIL) */}
+                      <div className="space-y-2">
                         <button
                           type="button"
                           onClick={() => {
-                            if (isActiveRegisteredCore) {
-                              navigateTo('CORE_HOME');
-                              return;
-                            }
-                            if (deviceIdentity?.role === 'CORE') {
-                              void handleStartDeviceSetup('CORE');
-                              return;
-                            }
                             navigateTo('EXPLAIN_CORE');
                           }}
-                          className="w-full p-3.5 rounded-2xl bg-[#111C2E] hover:bg-[#18263E] border-2 border-[#00CFE8]/50 hover:border-[#00CFE8] text-left transition-all active:scale-[0.99] cursor-pointer shadow-lg flex items-center justify-between gap-2"
+                          className="w-full p-2.5 rounded-2xl bg-[#111C2E] hover:bg-[#18263E] border-2 border-[#00CFE8]/50 hover:border-[#00CFE8] text-left transition-all active:scale-[0.99] cursor-pointer shadow-lg flex items-center justify-between gap-2"
                         >
                           <div className="flex items-center gap-2.5 min-w-0">
-                            <div className="w-9 h-9 rounded-xl bg-[#00CFE8]/15 border border-[#00CFE8]/40 flex items-center justify-center text-[#00CFE8] shrink-0">
-                              <Shield className="w-5 h-5" />
+                            <div className="w-8 h-8 rounded-xl bg-[#00CFE8]/15 border border-[#00CFE8]/40 flex items-center justify-center text-[#00CFE8] shrink-0">
+                              <Shield className="w-4 h-4" />
                             </div>
                             <div className="min-w-0">
                               <div className="flex items-center gap-1.5 flex-wrap">
                                 <span className="text-xs font-extrabold tracking-wide text-white">
-                                  VEL CORE — CONFIGURAR TELÉFONO PRINCIPAL
+                                  CONFIGURAR VEL CORE
                                 </span>
-                                {isActiveRegisteredCore && (
-                                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-[#00CFE8]/15 text-[#00CFE8] border border-[#00CFE8]/35">
-                                    Activo
-                                  </span>
-                                )}
                               </div>
+                              <span className="text-[10px] text-[#94A3B8] block leading-tight">
+                                Teléfono principal
+                              </span>
                             </div>
                           </div>
                           <ChevronRight className="w-4 h-4 text-[#00CFE8] shrink-0" />
@@ -1694,16 +1213,34 @@ export function App() {
 
                         <button
                           type="button"
-                          onClick={() => navigateTo('EXPLAIN_MOVIL')}
-                          className="w-full p-3.5 rounded-2xl bg-[#111C2E] hover:bg-[#18263E] border-2 border-[#10B981]/50 hover:border-[#10B981] text-left transition-all active:scale-[0.99] cursor-pointer shadow-lg flex items-center justify-between gap-2"
+                          onClick={() => {
+                            if (deviceIdentity?.role === 'TERMINAL') {
+                              navigateTo('TERMINAL_HOME');
+                              return;
+                            }
+                            navigateTo('EXPLAIN_MOVIL');
+                          }}
+                          className="w-full p-2.5 rounded-2xl bg-[#111C2E] hover:bg-[#18263E] border-2 border-[#10B981]/50 hover:border-[#10B981] text-left transition-all active:scale-[0.99] cursor-pointer shadow-lg flex items-center justify-between gap-2"
                         >
                           <div className="flex items-center gap-2.5 min-w-0">
-                            <div className="w-9 h-9 rounded-xl bg-[#10B981]/15 border border-[#10B981]/40 flex items-center justify-center text-[#10B981] shrink-0">
-                              <Smartphone className="w-5 h-5" />
+                            <div className="w-8 h-8 rounded-xl bg-[#10B981]/15 border border-[#10B981]/40 flex items-center justify-center text-[#10B981] shrink-0">
+                              <Smartphone className="w-4 h-4" />
                             </div>
-                            <span className="text-xs font-extrabold tracking-wide text-white">
-                              VEL MÓVIL — CONFIGURAR TELÉFONO DE USO DIARIO
-                            </span>
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="text-xs font-extrabold tracking-wide text-white">
+                                  CONFIGURAR VEL MÓVIL
+                                </span>
+                                {deviceIdentity?.role === 'TERMINAL' && (
+                                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] border border-[#10B981]/35">
+                                    Activo
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-[10px] text-[#94A3B8] block leading-tight">
+                                Teléfono de uso diario
+                              </span>
+                            </div>
                           </div>
                           <ChevronRight className="w-4 h-4 text-[#10B981] shrink-0" />
                         </button>
@@ -2122,15 +1659,19 @@ export function App() {
                           {!isSettingUpDevice && setupError && (
                             <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-xs text-[#F59E0B] space-y-2">
                               <p className="text-[11px] leading-snug">
-                                <strong>Registro en la nube pendiente:</strong> Tus claves locales siguen protegidas. Cuando recuperes conexión estable puedes reintentar.
+                                <strong>Registro en la nube pendiente:</strong> Tus claves locales siguen protegidas.
+                              </p>
+                              <p className="text-[11px] text-[#FCA5A5] bg-[#0B1220] p-2 rounded-lg border border-[#EF4444]/30 leading-snug break-words">
+                                {setupError}
                               </p>
                               <button
                                 type="button"
                                 onClick={handleRetryServerRegistration}
                                 disabled={isRetryingSync}
-                                className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                                className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                               >
-                                {isRetryingSync ? 'Reintentando...' : 'Reintentar registro'}
+                                {isRetryingSync && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                                <span>{isRetryingSync ? 'Registrando en la nube...' : 'Reintentar registro'}</span>
                               </button>
                             </div>
                           )}
@@ -2276,15 +1817,19 @@ export function App() {
                           {!isSettingUpDevice && setupError && (
                             <div className="p-3 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-xs text-[#F59E0B] space-y-2">
                               <p className="text-[11px] leading-snug">
-                                <strong>Registro en la nube pendiente:</strong> Tu identificación local sigue lista. Puedes reintentar cuando haya conexión.
+                                <strong>Registro en la nube pendiente:</strong> Tu identificación local sigue lista.
+                              </p>
+                              <p className="text-[11px] text-[#FCA5A5] bg-[#0B1220] p-2 rounded-lg border border-[#EF4444]/30 leading-snug break-words">
+                                {setupError}
                               </p>
                               <button
                                 type="button"
                                 onClick={handleRetryServerRegistration}
                                 disabled={isRetryingSync}
-                                className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                                className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                               >
-                                {isRetryingSync ? 'Reintentando...' : 'Reintentar registro'}
+                                {isRetryingSync && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                                <span>{isRetryingSync ? 'Registrando en la nube...' : 'Reintentar registro'}</span>
                               </button>
                             </div>
                           )}
@@ -2400,7 +1945,7 @@ export function App() {
                         </div>
                       </div>
 
-                      {/* 4 estados claros e independientes */}
+                      {/* 3 estados técnicos claros e independientes */}
                       {(() => {
                         const relaySimple = formatRelaySimpleStatus(relaySnapshot.connectionState);
                         const isConfirmedPaired = Boolean(
@@ -2448,41 +1993,69 @@ export function App() {
                               </div>
                             </div>
 
-                            <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#22324C]/70">
+                            <div className="flex items-center justify-between gap-2">
                               <span className="text-[#94A3B8] text-[11px]">Teléfono MÓVIL</span>
                               <span className={`font-bold text-[11px] ${phoneStatusCls}`}>
                                 {phoneStatusText}
                               </span>
                             </div>
 
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-[#94A3B8] text-[11px]">Suscripción comercial</span>
-                              <div className="flex items-center gap-2">
-                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${commercialStatusBadge.cls}`}>
-                                  {commercialStatusBadge.label}
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={() => setViewMode('WEB_PORTAL')}
-                                  className="text-[10px] font-bold text-[#00CFE8] hover:underline cursor-pointer"
-                                >
-                                  Gestionar
-                                </button>
-                              </div>
-                            </div>
-
                             {deviceIdentity.registrationStatus === 'pending_local' && (
-                              <div className="pt-1">
+                              <div className="pt-1 space-y-2">
                                 <button
                                   type="button"
                                   onClick={handleRetryServerRegistration}
                                   disabled={isRetryingSync}
-                                  className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                                  className="w-full h-9 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                                 >
-                                  {isRetryingSync ? 'Registrando...' : 'Completar registro en la nube'}
+                                  {isRetryingSync && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                                  <span>
+                                    {isRetryingSync ? 'Registrando en la nube...' : 'Completar registro en la nube'}
+                                  </span>
                                 </button>
+
+                                {(registrationFeedback?.type === 'error' || setupError || deviceIdentity.lastServerError) && (
+                                  <div className="p-2.5 rounded-xl bg-[#EF4444]/10 border border-[#EF4444]/35 text-[11px] text-[#FCA5A5] space-y-1">
+                                    <div className="flex items-center gap-1.5 font-bold text-[#EF4444]">
+                                      <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                                      <span>No se pudo completar el registro</span>
+                                    </div>
+                                    <p className="leading-snug break-words">
+                                      {registrationFeedback?.type === 'error'
+                                        ? registrationFeedback.message
+                                        : setupError || deviceIdentity.lastServerError}
+                                    </p>
+                                    {(requiresExternalConfig || registrationFeedback?.requiresConfig) && (
+                                      <p className="text-[10px] text-[#F59E0B] leading-snug pt-0.5">
+                                        Verifica en Firebase Console que Anonymous Authentication esté habilitado y en Netlify que FIREBASE_SERVICE_ACCOUNT y las Netlify Functions (/api/*) estén activas.
+                                      </p>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             )}
+
+                            {deviceIdentity.registrationStatus !== 'pending_local' &&
+                              deviceIdentity.registrationStatus !== 'revoked' &&
+                              registrationFeedback?.type === 'success' && (
+                                <div className="pt-1">
+                                  <div className="p-2.5 rounded-xl bg-[#10B981]/10 border border-[#10B981]/35 text-[11px] text-[#10B981] space-y-2">
+                                    <div className="flex items-center gap-1.5 font-bold">
+                                      <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                                      <span>{registrationFeedback.message}</span>
+                                    </div>
+                                    {!deviceIdentity.pairedPeerDeviceId && (
+                                      <button
+                                        type="button"
+                                        onClick={() => navigateTo('PAIRING_CORE')}
+                                        className="w-full h-8 rounded-lg bg-[#10B981] hover:bg-[#0ea571] text-[#0B1220] font-extrabold text-[11px] cursor-pointer"
+                                      >
+                                        Continuar a vinculación VEL MÓVIL
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
                           </div>
                         );
                       })()}
@@ -2983,17 +2556,29 @@ export function App() {
                             )}
 
                             {deviceIdentity.registrationStatus === 'pending_local' && (
-                              <div className="pt-1">
+                              <div className="pt-1 space-y-2">
                                 <button
                                   type="button"
                                   onClick={handleRetryServerRegistration}
                                   disabled={isRetryingSync}
-                                  className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                                  className="w-full h-9 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                                 >
-                                  {isRetryingSync ? 'Registrando...' : 'Completar registro en la nube'}
+                                  {isRetryingSync && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                                  <span>
+                                    {isRetryingSync ? 'Registrando en la nube...' : 'Completar registro en la nube'}
+                                  </span>
                                 </button>
                               </div>
                             )}
+
+                            {deviceIdentity.registrationStatus !== 'pending_local' &&
+                              deviceIdentity.registrationStatus !== 'revoked' &&
+                              registrationFeedback?.type === 'success' && (
+                                <div className="p-2.5 rounded-xl bg-[#10B981]/10 border border-[#10B981]/35 text-[11px] text-[#10B981] flex items-center gap-1.5 font-bold">
+                                  <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                                  <span>{registrationFeedback.message}</span>
+                                </div>
+                              )}
                           </div>
                         );
                       })()}
@@ -3014,18 +2599,21 @@ export function App() {
                             <p className="text-[11px] text-[#94A3B8] leading-snug">
                               Para poder emparejar este teléfono con tu VEL CORE, primero debe completarse el registro remoto de esta identidad en la nube. Tus claves locales ya están protegidas.
                             </p>
-                            {setupError && (
-                              <p className="text-[10px] text-[#F59E0B] leading-snug bg-[#0B1220] p-2 rounded-lg border border-[#F59E0B]/25">
-                                {setupError}
+                            {(registrationFeedback?.type === 'error' || setupError || deviceIdentity.lastServerError) && (
+                              <p className="text-[10px] text-[#FCA5A5] leading-snug bg-[#0B1220] p-2 rounded-lg border border-[#EF4444]/30 break-words">
+                                {registrationFeedback?.type === 'error'
+                                  ? registrationFeedback.message
+                                  : setupError || deviceIdentity.lastServerError}
                               </p>
                             )}
                             <button
                               type="button"
                               onClick={handleRetryServerRegistration}
                               disabled={isRetryingSync}
-                              className="w-full h-9 rounded-xl bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-xs cursor-pointer disabled:opacity-60"
+                              className="w-full h-9 rounded-xl bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                             >
-                              {isRetryingSync ? 'Registrando en la nube...' : 'Completar registro para vincular'}
+                              {isRetryingSync && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                              <span>{isRetryingSync ? 'Registrando en la nube...' : 'Completar registro para vincular'}</span>
                             </button>
                           </div>
                         )}
@@ -3378,16 +2966,40 @@ export function App() {
                           <p className="leading-snug">
                             <strong>Registro en la nube pendiente:</strong> primero completa el registro de VEL CORE para poder generar códigos de invitación.
                           </p>
+                          {(registrationFeedback?.type === 'error' || setupError || deviceIdentity.lastServerError) && (
+                            <div className="p-2 rounded-lg bg-[#0B1220] border border-[#EF4444]/35 text-[#FCA5A5] text-[10px] leading-snug space-y-1 break-words">
+                              <p>
+                                {registrationFeedback?.type === 'error'
+                                  ? registrationFeedback.message
+                                  : setupError || deviceIdentity.lastServerError}
+                              </p>
+                              {(requiresExternalConfig || registrationFeedback?.requiresConfig) && (
+                                <p className="text-[#F59E0B]">
+                                  Verifica Firebase Anonymous Authentication y la variable FIREBASE_SERVICE_ACCOUNT en Netlify.
+                                </p>
+                              )}
+                            </div>
+                          )}
                           <button
                             type="button"
                             onClick={handleRetryServerRegistration}
                             disabled={isRetryingSync}
-                            className="w-full h-8 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] cursor-pointer disabled:opacity-60"
+                            className="w-full h-9 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-[11px] inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                           >
-                            {isRetryingSync ? 'Registrando...' : 'Completar registro en la nube'}
+                            {isRetryingSync && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                            <span>{isRetryingSync ? 'Registrando en la nube...' : 'Completar registro en la nube'}</span>
                           </button>
                         </div>
                       )}
+
+                      {deviceIdentity.registrationStatus !== 'pending_local' &&
+                        deviceIdentity.registrationStatus !== 'revoked' &&
+                        registrationFeedback?.type === 'success' && (
+                          <div className="p-2.5 rounded-xl bg-[#10B981]/10 border border-[#10B981]/35 text-[11px] text-[#10B981] flex items-center gap-1.5 font-bold">
+                            <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                            <span>{registrationFeedback.message}</span>
+                          </div>
+                        )}
 
                       {relaySnapshot.connectionState !== 'AUTHENTICATED' &&
                         relaySnapshot.connectionState !== 'LINKED' && (
@@ -3515,6 +3127,7 @@ export function App() {
                             type="button"
                             onClick={handleCreatePairingOffer}
                             disabled={
+                              deviceIdentity.registrationStatus === 'pending_local' ||
                               isStartingPairingOffer ||
                               (relaySnapshot.connectionState !== 'AUTHENTICATED' &&
                                 relaySnapshot.connectionState !== 'LINKED')
@@ -4048,15 +3661,15 @@ export function App() {
                           VEL puede desinstalarse en cualquier momento manteniendo presionado el ícono de VEL en la pantalla de inicio o desde la configuración de aplicaciones del navegador.
                         </p>
                         <p className="text-[10px] text-[#F59E0B] leading-tight">
-                          Nota: Desinstalar la PWA o borrar los datos del sitio en VEL CORE elimina permanentemente los datos cifrados locales de ese navegador, y no cancela automáticamente suscripciones comerciales activas.
+                          Nota: Desinstalar la PWA o borrar los datos del sitio en VEL CORE elimina permanentemente los datos cifrados locales de ese navegador.
                         </p>
                       </div>
 
-                      {/* 4. Cláusula de Libertad de Contratación destacada en rojo (Requisito 12) */}
+                      {/* 4. Cláusula de independencia entre uso técnico y contratación externa (Requisito 12) */}
                       <div className="p-2.5 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-[#FCA5A5] space-y-1">
-                        <h4 className="font-extrabold text-[11px] text-white">Libertad de Contratación:</h4>
+                        <h4 className="font-extrabold text-[11px] text-white">Independencia de datos en VEL CORE:</h4>
                         <p className="text-[10px] leading-relaxed">
-                          No existe permanencia obligatoria. No se cobra por instalar, reinstalar, configurar, reemplazar o revocar dispositivos. Puedes cancelar tu suscripción libremente desde el Portal Web. Una suspensión comercial no borra los datos conservados en VEL CORE.
+                          No se cobra por instalar, reinstalar, configurar, reemplazar o revocar dispositivos. Tus datos e identidades permanecen bajo tu custodia exclusiva en VEL CORE.
                         </p>
                       </div>
 
@@ -4089,565 +3702,7 @@ export function App() {
         )}
 
         {/* ========================================================= */}
-        {/* VISTA 2: PORTAL WEB EXCLUSIVO DE CONTRATACIÓN Y SUSCRIPCIÓN */}
-        {/* ========================================================= */}
-        {viewMode === 'WEB_PORTAL' && (
-          <div className="max-w-2xl w-full bg-[#111C2E] border border-[#22324C] rounded-3xl p-6 sm:p-8 space-y-6 shadow-2xl">
-            <div className="border-b border-[#22324C] pb-4 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-[#00CFE8]">
-                  <CreditCard className="w-5 h-5" />
-                  <span className="text-xs font-bold uppercase tracking-wider">Portal Web Oficial</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={goHome}
-                  className="h-8 px-3 rounded-lg bg-[#0B1220] hover:bg-[#18263E] border border-[#22324C] text-[#00CFE8] hover:text-white text-xs font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
-                >
-                  <ArrowLeft className="w-3.5 h-3.5" />
-                  <span>VOLVER AL INICIO</span>
-                </button>
-              </div>
-              <h2 className="text-xl sm:text-2xl font-extrabold text-white">
-                Contratación y Suscripción del Servicio VEL
-              </h2>
-              <p className="text-xs text-[#94A3B8]">
-                Acceso sin contraseña y pago mensual manual a través de Mercado Pago.
-              </p>
-            </div>
-
-            {paymentReturnStatus && (
-              <div
-                className={`p-4 rounded-2xl border space-y-2 text-xs ${
-                  paymentReturnStatus === 'aprobado'
-                    ? 'bg-[#10B981]/10 border-[#10B981]/40 text-[#A7F3D0]'
-                    : paymentReturnStatus === 'pendiente'
-                    ? 'bg-[#F59E0B]/10 border-[#F59E0B]/40 text-[#FDE68A]'
-                    : 'bg-[#EF4444]/10 border-[#EF4444]/40 text-[#FCA5A5]'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <strong className="text-white">
-                    {paymentReturnStatus === 'aprobado'
-                      ? 'Retorno de pago aprobado en Mercado Pago'
-                      : paymentReturnStatus === 'pendiente'
-                      ? 'Pago pendiente de acreditación'
-                      : 'Pago cancelado en Mercado Pago'}
-                  </strong>
-                  <button
-                    type="button"
-                    onClick={() => setPaymentReturnStatus(null)}
-                    className="text-[11px] underline cursor-pointer"
-                  >
-                    Ocultar
-                  </button>
-                </div>
-                <p className="text-[11px] leading-relaxed">
-                  {paymentReturnStatus === 'aprobado'
-                    ? 'Tu regreso desde Mercado Pago se registró. La vigencia comercial de 30 días solo se acredita en Firestore cuando el webhook oficial del servidor verifica el pago aprobado ante Mercado Pago.'
-                    : paymentReturnStatus === 'pendiente'
-                    ? 'El pago quedó pendiente en Mercado Pago (por ejemplo, pago en efectivo). Tu estado en Firestore se actualizará automáticamente al acreditarse.'
-                    : 'El proceso en Checkout Pro fue cancelado o interrumpido. No se realizó ningún cambio en tu vigencia.'}
-                </p>
-                {currentUser && (
-                  <button
-                    type="button"
-                    disabled={isRefreshingSubscription}
-                    onClick={() => void handleRefreshSubscriptionFromFirestore()}
-                    className="px-3 py-1.5 rounded-lg bg-[#18263E] hover:bg-[#22324C] text-[#00CFE8] font-bold text-[11px] cursor-pointer disabled:opacity-50"
-                  >
-                    {isRefreshingSubscription ? 'Consultando Firestore...' : 'Actualizar estado real desde Firestore'}
-                  </button>
-                )}
-              </div>
-            )}
-
-            <div className="space-y-4">
-              {/* Paso 1: Identificación sin contraseña (Enlace de verificación por correo) */}
-              <div className="p-4 rounded-2xl bg-[#0B1220] border border-[#22324C] space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-white flex items-center gap-2">
-                    <span className="w-5 h-5 rounded-full bg-[#00CFE8] text-[#0B1220] flex items-center justify-center text-[11px] font-extrabold">1</span>
-                    Identificación por Enlace Único (Sin contraseña)
-                  </span>
-                  {currentUser && (
-                    <span className="text-[10px] bg-[#10B981]/15 text-[#10B981] font-bold px-2 py-0.5 rounded">
-                      Sesión activa
-                    </span>
-                  )}
-                </div>
-
-                {currentUser ? (
-                  <div className="flex items-center justify-between p-3 rounded-xl bg-[#111C2E] border border-[#10B981]/30">
-                    <div className="flex items-center gap-2.5">
-                      <div className="w-8 h-8 rounded-lg bg-[#10B981]/15 text-[#10B981] flex items-center justify-center font-bold">
-                        <Check className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <p className="text-xs font-bold text-white">{currentUser.email}</p>
-                        <p className="text-[10px] text-[#94A3B8]">
-                          Cuenta verificada sin contraseña en Firebase Authentication
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      onClick={handleWebLogout}
-                      className="px-3 py-1 rounded-lg border border-[#EF4444]/40 hover:bg-[#EF4444]/10 text-[#EF4444] text-xs font-semibold cursor-pointer"
-                    >
-                      Cerrar sesión
-                    </button>
-                  </div>
-                ) : needsLinkEmailConfirm ? (
-                  <form onSubmit={handleConfirmEmailForLink} noValidate className="space-y-3">
-                    <p className="text-[11px] text-[#F59E0B] leading-relaxed">
-                      Abriste el enlace de acceso en un navegador distinto. Confirma tu correo electrónico para validar el enlace de un solo uso y recuperar tu cuenta:
-                    </p>
-                    <input
-                      type="email"
-                      value={confirmLinkEmailInput}
-                      onChange={(e) => {
-                        setConfirmLinkEmailInput(e.target.value);
-                        if (authError) setAuthError(null);
-                      }}
-                      placeholder="Confirma tu correo electrónico (obligatorio)..."
-                      className="w-full h-10 px-3 bg-[#111C2E] border border-[#22324C] rounded-xl text-xs text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
-                    />
-                    {authError && <p className="text-xs text-[#EF4444] font-medium">{authError}</p>}
-                    <button
-                      type="submit"
-                      disabled={isSubmittingAuth}
-                      className="w-full h-10 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-xs cursor-pointer"
-                    >
-                      {isSubmittingAuth ? 'Verificando enlace...' : 'Completar acceso sin contraseña'}
-                    </button>
-                  </form>
-                ) : (
-                  <form onSubmit={handleRequestPasswordlessLink} noValidate className="space-y-3">
-                    <p className="text-[11px] text-[#94A3B8] leading-relaxed">
-                      VEL no utiliza contraseñas. Ingresa tu correo para recibir un enlace de verificación de un solo uso. Si ya eras suscriptor, conservarás exactamente tu cuenta, tarifa histórica y vigencia actual.
-                    </p>
-
-                    <input
-                      type="email"
-                      value={authEmail}
-                      onChange={(e) => {
-                        setAuthEmail(e.target.value);
-                        if (authError) setAuthError(null);
-                      }}
-                      placeholder="Correo electrónico del titular (obligatorio)..."
-                      className="w-full h-10 px-3 bg-[#111C2E] border border-[#22324C] rounded-xl text-xs text-white placeholder-[#94A3B8]/60 focus:outline-none focus:border-[#00CFE8]"
-                    />
-
-                    {authError && <p className="text-xs text-[#EF4444] font-medium">{authError}</p>}
-                    {authSuccess && <p className="text-xs text-[#10B981] font-medium leading-relaxed">{authSuccess}</p>}
-
-                    <button
-                      type="submit"
-                      disabled={isSubmittingAuth || authLoading}
-                      className="w-full h-10 rounded-xl bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-xs cursor-pointer disabled:opacity-60"
-                    >
-                      {isSubmittingAuth
-                        ? 'Enviando enlace seguro...'
-                        : emailLinkSentTo
-                        ? 'Reenviar enlace de acceso sin contraseña'
-                        : 'Enviar enlace de acceso sin contraseña'}
-                    </button>
-                  </form>
-                )}
-              </div>
-
-              {/* Plan y Contratación con Precio Centralizado */}
-              <div className="p-4 rounded-2xl bg-[#0B1220] border border-[#22324C] space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-white flex items-center gap-2">
-                    <span className="w-5 h-5 rounded-full bg-[#00CFE8] text-[#0B1220] flex items-center justify-center text-[11px] font-extrabold">2</span>
-                    Plan Oficial VEL (2 Teléfonos: CORE + MÓVIL)
-                  </span>
-                  <span className="text-xs font-mono font-bold text-[#00CFE8] bg-[#00CFE8]/10 px-2 py-0.5 rounded border border-[#00CFE8]/20">
-                    ${serverPricing.monto.toLocaleString()} {serverPricing.moneda} / mes
-                  </span>
-                </div>
-                <p className="text-xs text-[#94A3B8]">
-                  Licencia para un teléfono principal (VEL CORE custodio) y un dispositivo personal (VEL MÓVIL terminal).
-                </p>
-                {subscriberDoc?.precioContratado &&
-                  (subscriberDoc.fechaUltimoPago ||
-                    subscriberDoc.venceEl ||
-                    ['activo', 'en_gracia', 'suspendido', 'vencido'].includes(subscriberDoc.estado)) && (
-                    <p className="text-[11px] text-[#10B981] bg-[#10B981]/10 p-2 rounded-lg border border-[#10B981]/25">
-                      Tu tarifa histórica conservada: <strong>${subscriberDoc.precioContratado.toLocaleString()} {subscriberDoc.moneda || 'ARS'} / 30 días</strong> (se respeta en todas tus renovaciones).
-                    </p>
-                  )}
-              </div>
-
-              {/* Términos y Condiciones */}
-              <div className="p-4 rounded-2xl bg-[#0B1220] border border-[#22324C] space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-bold text-white flex items-center gap-2">
-                    <span className="w-5 h-5 rounded-full bg-[#00CFE8] text-[#0B1220] flex items-center justify-center text-[11px] font-extrabold">3</span>
-                    Lectura y Aceptación de Términos ({CURRENT_CONTRACT_VERSION})
-                  </span>
-                  {contractAcceptanceDoc?.aceptado && (
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] border border-[#10B981]/30">
-                      Registrado en Firestore ✓
-                    </span>
-                  )}
-                </div>
-                <a
-                  href={OFFICIAL_CONTRACT_URL}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="w-full h-10 rounded-xl bg-[#18263E] hover:bg-[#22324C] border border-[#00CFE8]/40 text-[#00CFE8] font-bold text-xs flex items-center justify-center gap-2"
-                >
-                  <ExternalLink className="w-4 h-4" />
-                  <span>Consultar términos y condiciones</span>
-                </a>
-
-                <label className="flex items-start gap-3 p-3 rounded-xl bg-[#111C2E] border border-[#22324C] cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={webContractAccepted}
-                    disabled={isRecordingContract}
-                    onChange={(e) => void handleContractCheckboxChange(e.target.checked)}
-                    className="mt-0.5 w-4 h-4 rounded border-[#22324C] bg-[#0B1220] text-[#00CFE8] accent-[#00CFE8] shrink-0"
-                  />
-                  <span className="text-xs text-white leading-relaxed">
-                    <strong className="text-[#00CFE8]">Acepto obligatoriamente</strong> los Términos y Condiciones y el Contrato de Uso para contratar el servicio.
-                    {isRecordingContract && (
-                      <span className="block text-[11px] text-[#00CFE8] mt-1">
-                        Registrando aceptación legal en Firestore...
-                      </span>
-                    )}
-                  </span>
-                </label>
-
-                {contractError && (
-                  <div className="p-2.5 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/30 text-[11px] text-[#FCA5A5] leading-snug">
-                    {contractError}
-                  </div>
-                )}
-              </div>
-
-              {/* Paso 4: Estado Comercial de la Suscripción y Pasarela Mercado Pago (Checkout Pro 30 días) */}
-              {(() => {
-                const nowMs = Date.now();
-                const venceMs = subscriberDoc?.venceEl ? Date.parse(subscriberDoc.venceEl) : NaN;
-                const hasValidVence = !Number.isNaN(venceMs);
-                const isExpiredByDate = hasValidVence && venceMs <= nowMs;
-                const daysRemaining = hasValidVence
-                  ? Math.max(0, Math.ceil((venceMs - nowMs) / (24 * 60 * 60 * 1000)))
-                  : null;
-                const isActivelyValid = subscriberDoc?.estado === 'activo' && (!hasValidVence || !isExpiredByDate);
-                const isExpiringSoon = isActivelyValid && daysRemaining !== null && daysRemaining <= 7;
-                const isExpiredState =
-                  subscriberDoc?.estado === 'vencido' ||
-                  (subscriberDoc?.estado === 'activo' && isExpiredByDate);
-                const hasLegacyAutoPreapproval =
-                  Boolean(subscriberDoc?.mpPreapprovalId) &&
-                  subscriberDoc?.modalidadComercial !== 'manual_30d';
-
-                const badgeLabel = isExpiredState
-                  ? 'VENCIDO'
-                  : isExpiringSoon
-                  ? 'PRÓXIMO A VENCER'
-                  : subscriberDoc?.estado
-                  ? subscriberDoc.estado.toUpperCase().replace('_', ' ')
-                  : 'NO CONTRATADA';
-
-                return (
-                  <div className="p-4 rounded-2xl bg-[#0B1220] border border-[#22324C] space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold text-white flex items-center gap-2">
-                        <span className="w-5 h-5 rounded-full bg-[#00CFE8] text-[#0B1220] flex items-center justify-center text-[11px] font-extrabold">4</span>
-                        {hasLegacyAutoPreapproval
-                          ? 'Suscripción Histórica (Mercado Pago Preapproval)'
-                          : 'Suscripción Manual 30 días (Mercado Pago Checkout Pro)'}
-                      </span>
-                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
-                        isActivelyValid && !isExpiringSoon
-                          ? 'bg-[#10B981]/20 text-[#10B981] border border-[#10B981]/40'
-                          : isExpiringSoon || subscriberDoc?.estado === 'en_gracia'
-                          ? 'bg-[#F59E0B]/20 text-[#F59E0B] border border-[#F59E0B]/40'
-                          : isExpiredState || subscriberDoc?.estado === 'suspendido'
-                          ? 'bg-[#EF4444]/20 text-[#EF4444] border border-[#EF4444]/40'
-                          : 'bg-[#94A3B8]/20 text-[#94A3B8] border border-[#94A3B8]/40'
-                      }`}>
-                        {badgeLabel}
-                      </span>
-                    </div>
-
-                    {/* Caso 1: Suscripción ACTIVA y VIGENTE (incluye aviso si está próxima a vencer) */}
-                    {isActivelyValid && (
-                      <div className={`p-3.5 rounded-xl border space-y-2.5 ${
-                        isExpiringSoon
-                          ? 'bg-[#F59E0B]/10 border-[#F59E0B]/30'
-                          : 'bg-[#10B981]/10 border-[#10B981]/30'
-                      }`}>
-                        <div className={`flex items-center gap-2 font-bold text-xs ${
-                          isExpiringSoon ? 'text-[#F59E0B]' : 'text-[#10B981]'
-                        }`}>
-                          {isExpiringSoon ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle className="w-4 h-4" />}
-                          <span>
-                            {isExpiringSoon
-                              ? `Suscripción Próxima a Vencer (${daysRemaining} día${daysRemaining === 1 ? '' : 's'} restante${daysRemaining === 1 ? '' : 's'})`
-                              : 'Suscripción Oficial Habilitada y al Día'}
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-[#94A3B8]">
-                          {isExpiringSoon
-                            ? 'Puedes renovar manualmente ahora por otros 30 días: los días nuevos se sumarán exactamente a partir de tu fecha de vencimiento actual.'
-                            : hasLegacyAutoPreapproval
-                            ? 'Tu servicio VEL está activo bajo suscripción recurrente histórica.'
-                            : 'Tu servicio VEL está activo bajo modalidad manual por 30 días (sin débitos automáticos).'}
-                        </p>
-                        {subscriberDoc?.venceEl && (
-                          <p className="text-[10px] text-white font-mono">
-                            Vence el: {new Date(subscriberDoc.venceEl).toLocaleDateString()}
-                            {daysRemaining !== null ? ` (${daysRemaining} días restantes)` : ''}
-                          </p>
-                        )}
-                        <div className="flex flex-wrap gap-2 pt-1">
-                          <button
-                            type="button"
-                            onClick={handleAuthorizedDownload}
-                            disabled={isCheckingDownload}
-                            className="flex-1 min-w-[180px] h-9 rounded-lg bg-[#10B981] hover:bg-[#059669] text-[#0B1220] font-bold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                            title="Paquete autorizado para suscriptores con vigencia al día"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                            <span>{isCheckingDownload ? 'Verificando vigencia...' : 'Paquete autorizado (.zip)'}</span>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={handleStartCheckout}
-                            disabled={isStartingCheckout}
-                            className="flex-1 min-w-[180px] h-9 rounded-lg bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                          >
-                            <RefreshCw className="w-3.5 h-3.5" />
-                            <span>{isStartingCheckout ? 'Conectando...' : 'Renovar 30 días anticipadamente ↗'}</span>
-                          </button>
-
-                          {hasLegacyAutoPreapproval && (
-                            <button
-                              type="button"
-                              onClick={handleCancelSubscription}
-                              disabled={isCancellingSub}
-                              className="px-3 h-9 rounded-lg border border-[#EF4444]/40 hover:bg-[#EF4444]/15 text-[#EF4444] text-xs font-semibold cursor-pointer"
-                            >
-                              {isCancellingSub ? 'Cancelando...' : 'Cancelar suscripción'}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Caso 2: Suscripción VENCIDA (por estado 'vencido' o fecha venceEl expirada) */}
-                    {isExpiredState && (
-                      <div className="p-3.5 rounded-xl bg-[#EF4444]/10 border border-[#EF4444]/30 space-y-2.5">
-                        <div className="flex items-center gap-2 text-[#EF4444] font-bold text-xs">
-                          <AlertTriangle className="w-4 h-4" />
-                          <span>Período de 30 Días Vencido</span>
-                        </div>
-                        <p className="text-[11px] text-[#94A3B8]">
-                          Tu período de vigencia finalizó{subscriberDoc?.venceEl ? ` el ${new Date(subscriberDoc.venceEl).toLocaleDateString()}` : ''}. Las descargas están pausadas hasta acreditar una nueva renovación manual de 30 días.
-                        </p>
-                        <p className="text-[10px] text-[#00CFE8] bg-[#00CFE8]/10 p-2 rounded-lg border border-[#00CFE8]/20">
-                          <strong>Garantía de Soberanía:</strong> Tus notas, claves e identidades en VEL CORE permanecen 100% intactas. Al renovarse el pago, se conserva tu tarifa histórica contratada.
-                        </p>
-                        <button
-                          type="button"
-                          onClick={handleStartCheckout}
-                          disabled={isStartingCheckout}
-                          className="w-full h-9 rounded-lg bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
-                        >
-                          {isStartingCheckout ? 'Conectando...' : 'Renovar 30 días en Mercado Pago ↗'}
-                        </button>
-                      </div>
-                    )}
-
-                    {/* Caso 3: Suscripción EN PERÍODO DE GRACIA (7 días) */}
-                    {subscriberDoc?.estado === 'en_gracia' && (
-                      <div className="p-3.5 rounded-xl bg-[#F59E0B]/10 border border-[#F59E0B]/30 space-y-2.5">
-                        <div className="flex items-center gap-2 text-[#F59E0B] font-bold text-xs">
-                          <AlertTriangle className="w-4 h-4" />
-                          <span>Período de Gracia Activo (Tolerancia de 7 días)</span>
-                        </div>
-                        <p className="text-[11px] text-[#94A3B8]">
-                          Tu pago mensual está pendiente de confirmación en Mercado Pago. <strong className="text-white">El servicio continúa habilitado</strong> durante el período de gracia de 7 días. Regulariza el pago mediante Checkout Pro para evitar la suspensión comercial.
-                        </p>
-                        <button
-                          type="button"
-                          onClick={handleStartCheckout}
-                          disabled={isStartingCheckout}
-                          className="w-full h-9 rounded-lg bg-[#F59E0B] hover:bg-[#D97706] text-[#0B1220] font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
-                        >
-                          {isStartingCheckout ? 'Conectando...' : 'Regularizar pago (30 días) en Mercado Pago ↗'}
-                        </button>
-                      </div>
-                    )}
-
-                    {/* Caso 4: Suscripción SUSPENDIDA */}
-                    {subscriberDoc?.estado === 'suspendido' && (
-                      <div className="p-3.5 rounded-xl bg-[#EF4444]/10 border border-[#EF4444]/30 space-y-2.5">
-                        <div className="flex items-center gap-2 text-[#EF4444] font-bold text-xs">
-                          <Ban className="w-4 h-4" />
-                          <span>Acceso Comercial Suspendido</span>
-                        </div>
-                        <p className="text-[11px] text-[#94A3B8]">
-                          El acceso comercial se encuentra suspendido por vencimiento o reversión del pago.
-                        </p>
-                        <p className="text-[10px] text-[#00CFE8] bg-[#00CFE8]/10 p-2 rounded-lg border border-[#00CFE8]/20">
-                          <strong>Garantía de Soberanía:</strong> La suspensión comercial no borra notas, claves ni información de tu VEL CORE, ni desvincula dispositivos. Al acreditar un nuevo pago de 30 días se reactiva automáticamente.
-                        </p>
-                        <button
-                          type="button"
-                          onClick={handleStartCheckout}
-                          disabled={isStartingCheckout}
-                          className="w-full h-9 rounded-lg bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
-                        >
-                          {isStartingCheckout ? 'Conectando...' : 'Reactivar 30 días con Mercado Pago ↗'}
-                        </button>
-                      </div>
-                    )}
-
-                    {/* Caso 5: No contratado, Pendiente de Pago Inicial o Cancelado */}
-                    {(!subscriberDoc?.estado || subscriberDoc.estado === 'pendiente_pago' || subscriberDoc.estado === 'cancelado') && (
-                      <div className="space-y-2.5">
-                        <p className="text-[11px] text-[#94A3B8] leading-relaxed">
-                          La contratación se realiza por pago manual de <strong>30 días mediante Mercado Pago Checkout Pro</strong> (tarjetas, saldo en cuenta, Rapipago o Pago Fácil). La vigencia se acredita al confirmarse el pago aprobado.
-                        </p>
-
-                        <button
-                          type="button"
-                          onClick={handleStartCheckout}
-                          disabled={isStartingCheckout || !currentUser || !webContractAccepted}
-                          className={`w-full h-11 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all shadow-lg ${
-                            currentUser && webContractAccepted
-                              ? 'bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] cursor-pointer'
-                              : 'bg-[#18263E] text-[#94A3B8] cursor-not-allowed opacity-60'
-                          }`}
-                        >
-                          <CreditCard className="w-4 h-4" />
-                          <span>{isStartingCheckout ? 'Generando preferencia...' : 'CONTRATAR 30 DÍAS EN MERCADO PAGO ↗'}</span>
-                        </button>
-
-                        {(!currentUser || !webContractAccepted) && (
-                          <p className="text-[10px] text-[#F59E0B] text-center">
-                            {!currentUser
-                              ? 'Debes registrarte o iniciar sesión en el Paso 1.'
-                              : 'Debes marcar la aceptación de Términos en el Paso 3 para habilitar el botón.'}
-                          </p>
-                        )}
-                      </div>
-                    )}
-
-                    {checkoutError && (
-                      <div className="p-3 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/30 text-xs text-[#EF4444] leading-relaxed">
-                        {checkoutError}
-                      </div>
-                    )}
-
-                    {cancelMessage && (
-                      <div className="p-3 rounded-xl bg-[#10B981]/15 border border-[#10B981]/30 text-xs text-[#10B981] leading-relaxed">
-                        {cancelMessage}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-
-              {/* Paso 5: Panel Administrativo de Precios (Solo Administrador Autorizado) */}
-              {isAdmin && (
-                <div className="p-4 rounded-2xl bg-[#0B1220] border border-[#00CFE8]/30 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-white flex items-center gap-2">
-                      <Shield className="w-4 h-4 text-[#00CFE8]" />
-                      Panel Administrativo Comercial
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowAdminPanel(!showAdminPanel);
-                        if (!showAdminPanel) loadAdminHistory();
-                      }}
-                      className="text-[10px] font-bold px-2.5 py-1 rounded-lg bg-[#18263E] hover:bg-[#22324C] text-[#00CFE8] cursor-pointer"
-                    >
-                      {showAdminPanel ? 'Ocultar panel' : 'Gestionar precios'}
-                    </button>
-                  </div>
-
-                  {showAdminPanel && (
-                    <div className="space-y-3 pt-2 border-t border-[#22324C]">
-                      <p className="text-[11px] text-[#94A3B8] leading-relaxed">
-                        <strong className="text-white">Regla Comercial:</strong> Los nuevos suscriptores contratarán al precio vigente aquí configurado. Los suscriptores existentes conservan de forma inmutable el precio al que contrataron.
-                      </p>
-
-                      <form onSubmit={handleUpdatePriceAdmin} noValidate className="space-y-2">
-                        <div className="grid grid-cols-2 gap-2">
-                          <div>
-                            <label className="text-[10px] text-[#94A3B8] block mb-1">Monto mensual (obligatorio):</label>
-                            <input
-                              type="number"
-                              value={adminNewPrice}
-                              onChange={(e) => {
-                                setAdminNewPrice(e.target.value);
-                                if (adminPriceMsg) setAdminPriceMsg(null);
-                              }}
-                              className="w-full h-9 px-3 bg-[#111C2E] border border-[#22324C] rounded-lg text-xs text-white"
-                              min="1"
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[10px] text-[#94A3B8] block mb-1">Moneda:</label>
-                            <select
-                              value={adminNewCurrency}
-                              onChange={(e) => setAdminNewCurrency(e.target.value)}
-                              className="w-full h-9 px-2 bg-[#111C2E] border border-[#22324C] rounded-lg text-xs text-white"
-                            >
-                              <option value="ARS">ARS (Pesos Argentinos)</option>
-                              <option value="USD">USD (Dólares)</option>
-                              <option value="BRL">BRL (Reales)</option>
-                              <option value="MXN">MXN (Pesos Mexicanos)</option>
-                            </select>
-                          </div>
-                        </div>
-
-                        {adminPriceMsg && (
-                          <p className="text-[11px] text-[#00CFE8] font-medium">{adminPriceMsg}</p>
-                        )}
-
-                        <button
-                          type="submit"
-                          className="w-full h-9 rounded-lg bg-[#00CFE8] hover:bg-[#00b8ce] text-[#0B1220] font-bold text-xs cursor-pointer"
-                        >
-                          Guardar nuevo precio oficial
-                        </button>
-                      </form>
-
-                      {adminHistory.length > 0 && (
-                        <div className="pt-2 space-y-1">
-                          <span className="text-[10px] font-bold text-white block">Historial de tarifas:</span>
-                          <div className="max-h-28 overflow-y-auto space-y-1 text-[10px] font-mono text-[#94A3B8]">
-                            {adminHistory.map((item) => (
-                              <div key={item.id} className="p-1.5 rounded bg-[#111C2E] flex justify-between">
-                                <span>${item.monto} {item.moneda}</span>
-                                <span>{new Date(item.actualizadoEl).toLocaleDateString()}</span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ========================================================= */}
-        {/* VISTA 3: INSTALACIÓN DE VEL COMO PWA OFICIAL */}
+        {/* VISTA 2: INSTALACIÓN DE VEL COMO PWA OFICIAL */}
         {/* ========================================================= */}
         {viewMode === 'INSTALL_INFO' && (
           <div className="max-w-2xl w-full bg-[#111C2E] border border-[#22324C] rounded-3xl p-6 sm:p-8 space-y-6 shadow-2xl">

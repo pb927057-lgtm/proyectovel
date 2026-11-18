@@ -278,8 +278,11 @@ async function runIntegrationFinalTests() {
     appTsx.includes('velOfflineSync') &&
       appTsx.includes('Bóveda Local Cifrada (CORE)') &&
       appTsx.includes('Limpiar memoria') &&
-      appTsx.includes('pago_retorno'),
-    'App.tsx integra bóveda local cifrada solo en CORE, memoria volátil en MÓVIL y retorno de Mercado Pago'
+      !appTsx.includes('Suscripción comercial') &&
+      !appTsx.includes('Sin sesión comercial abierta') &&
+      !appTsx.includes('WEB_PORTAL') &&
+      !appTsx.includes('commercialStatusBadge'),
+    'App.tsx integra bóveda local cifrada solo en CORE, memoria volátil en MÓVIL y excluye interfaz comercial (delegada a Blogger)'
   );
 
   // ------------------------------------------------------------------------
@@ -293,13 +296,13 @@ async function runIntegrationFinalTests() {
       !isTechnicalAccount('uid-cliente-real', 'cliente@ejemplo.com'),
     'Cuentas técnicas bloqueadas sin afectar a clientes reales'
   );
+  const firestoreTs = fs.readFileSync(path.join(root, 'src', 'services', 'firestore.ts'), 'utf8');
   assert(
     !/recordContractAcceptance\([^)]*\)\.catch/.test(appTsx) &&
       !/getContractAcceptance\([^)]*\)\.catch/.test(appTsx) &&
-      appTsx.includes('recordContractAcceptance') &&
-      appTsx.includes('!acceptanceRes.success') &&
-      appTsx.includes('setContractError'),
-    'App.tsx maneja errores de recordContractAcceptance sin silenciarlos y bloquea Checkout ante fallo'
+      firestoreTs.includes('recordContractAcceptance') &&
+      firestoreTs.includes('isTechnicalAccount(uid, userEmail)'),
+    'Gestión de contratos en firestore.ts protege cuentas técnicas y no silencia errores en la app'
   );
 
   // ------------------------------------------------------------------------

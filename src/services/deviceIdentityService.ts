@@ -37,6 +37,7 @@ export interface DeviceSessionSyncResult {
   identity: DeviceIdentitySummary;
   serverDevice?: DeviceRecord | null;
   revoked?: boolean;
+  requiresExternalConfig?: boolean;
   error?: string;
 }
 
@@ -48,11 +49,39 @@ export interface DeviceIdentityDeps {
   fetchFn?: typeof fetch;
 }
 
+const SERVER_REQUEST_TIMEOUT_MS = 15000;
+
 function resolveBoundFetch(customFetch?: typeof fetch): typeof fetch {
   if (!customFetch || (typeof globalThis !== 'undefined' && customFetch === globalThis.fetch)) {
     return (...args: Parameters<typeof fetch>) => globalThis.fetch(...args);
   }
   return (...args: Parameters<typeof fetch>) => customFetch(...args);
+}
+
+async function fetchWithTimeout(
+  safeFetch: typeof fetch,
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs: number = SERVER_REQUEST_TIMEOUT_MS
+): Promise<Response> {
+  if (typeof AbortController === 'undefined') {
+    return safeFetch(input, init);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await safeFetch(input, {
+      ...init,
+      signal: init.signal || controller.signal
+    });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Tiempo de espera agotado al contactar el servidor de VEL (15 s). Comprueba tu conexión e inténtalo nuevamente.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function toIdentitySummary(record: LocalDeviceIdentityRecord): DeviceIdentitySummary {
@@ -216,6 +245,57 @@ export async function setupNewDeviceIdentity(
   });
 }
 
+async function verifyExistingCloudRegistration(
+  localRecord: LocalDeviceIdentityRecord,
+  idToken: string,
+  safeFetch: typeof fetch,
+  storage: VelStorageAdapter
+): Promise<{ recovered: boolean; record?: LocalDeviceIdentityRecord; revokedError?: string }> {
+  try {
+    const verifyRes = await fetchWithTimeout(
+      safeFetch,
+      `/api/device-session?deviceId=${encodeURIComponent(localRecord.deviceId)}`,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${idToken}`
+        }
+      }
+    );
+    const verifyCt = (verifyRes.headers?.get?.('content-type') || '').toLowerCase();
+    if (verifyCt.includes('text/html')) {
+      return { recovered: false };
+    }
+    const verifyData = await verifyRes.json().catch(() => ({}));
+    if (!verifyRes.ok || !verifyData.success || !verifyData.device) {
+      return { recovered: false };
+    }
+    const serverDevice = verifyData.device as DeviceRecord;
+    const syncedRecord: LocalDeviceIdentityRecord = {
+      ...localRecord,
+      registrationStatus: serverDevice.status,
+      activeLinkId: serverDevice.activeLinkId || null,
+      pairedPeerDeviceId: serverDevice.pairedPeerDeviceId || null,
+      lastServerError:
+        serverDevice.status === 'revoked'
+          ? 'Este dispositivo fue revocado permanentemente en Firestore.'
+          : null,
+      updatedAt: new Date().toISOString()
+    };
+    await storage.saveIdentity(syncedRecord);
+    return {
+      recovered: true,
+      record: syncedRecord,
+      revokedError:
+        serverDevice.status === 'revoked'
+          ? 'Este dispositivo fue revocado permanentemente en Firestore.'
+          : undefined
+    };
+  } catch {
+    return { recovered: false };
+  }
+}
+
 async function registerLocalIdentityOnServer(
   localRecord: LocalDeviceIdentityRecord,
   idToken: string,
@@ -225,7 +305,7 @@ async function registerLocalIdentityOnServer(
 ): Promise<DeviceSetupResult> {
   const safeFetch = resolveBoundFetch(deps.fetchFn);
   try {
-    const response = await safeFetch('/api/register-device', {
+    const response = await fetchWithTimeout(safeFetch, '/api/register-device', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -265,9 +345,44 @@ async function registerLocalIdentityOnServer(
     }
 
     const data = await response.json().catch(() => ({}));
+
+    // Si una petición previa ya había creado el documento en Firestore antes de un corte de red,
+    // el servidor responde 409 DUPLICATE_DEVICE_ID. Verificamos propiedad real vía /api/device-session.
+    if (response.status === 409 && data.code === 'DUPLICATE_DEVICE_ID') {
+      const recovery = await verifyExistingCloudRegistration(
+        localRecord,
+        idToken,
+        safeFetch,
+        deps.storage
+      );
+      if (recovery.recovered && recovery.record) {
+        const isRevoked = recovery.record.registrationStatus === 'revoked';
+        if (steps && steps[3]) {
+          steps[3] = {
+            step: 'backend_register',
+            status: isRevoked ? 'error' : 'done',
+            detail: isRevoked
+              ? recovery.revokedError || 'Dispositivo revocado.'
+              : 'Identidad pública ya verificada en Cloud Firestore.'
+          };
+          onProgress?.(steps.map((s) => ({ ...s })));
+        }
+        return {
+          success: !isRevoked,
+          identity: toIdentitySummary(recovery.record),
+          registeredInServer: !isRevoked,
+          error: recovery.revokedError
+        };
+      }
+    }
+
     if (!response.ok || !data.success) {
-      const errMsg =
+      const missingVars = Array.isArray(data.missingVariables) && data.missingVariables.length > 0
+        ? ` Variables faltantes en Netlify: ${data.missingVariables.join(', ')}.`
+        : '';
+      const baseError =
         data.error || `Error registrando dispositivo en el servidor (HTTP ${response.status}).`;
+      const errMsg = `${baseError}${missingVars}`.trim();
       const updated: LocalDeviceIdentityRecord = {
         ...localRecord,
         lastServerError: errMsg,
@@ -284,7 +399,7 @@ async function registerLocalIdentityOnServer(
         success: false,
         identity: toIdentitySummary(updated),
         registeredInServer: false,
-        requiresExternalConfig: Boolean(data.pendingConfig),
+        requiresExternalConfig: Boolean(data.pendingConfig || response.status === 503),
         error: errMsg
       };
     }
@@ -419,12 +534,14 @@ export async function syncPersistedDeviceSession(
     return {
       synced: retryRes.registeredInServer,
       identity: retryRes.identity || toIdentitySummary(existing),
+      requiresExternalConfig: Boolean(retryRes.requiresExternalConfig),
       error: retryRes.error
     };
   }
 
   try {
-    const res = await fetchFn(
+    const res = await fetchWithTimeout(
+      fetchFn,
       `/api/device-session?deviceId=${encodeURIComponent(existing.deviceId)}`,
       {
         method: 'GET',
