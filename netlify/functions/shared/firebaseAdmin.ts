@@ -1,262 +1,234 @@
-import { initializeApp, getApps, cert, App } from 'firebase-admin/app';
-import { getFirestore, Firestore } from 'firebase-admin/firestore';
-import { getAuth, Auth } from 'firebase-admin/auth';
+import type { Firestore, DocumentSnapshot } from 'firebase-admin/firestore';
+import { getAdminDb, hasFirebaseAdminCredentials } from './firebaseAdmin';
+import { PricingConfig, PricingHistoryEntry } from './types';
 
-// Correos electrónicos autorizados para administración comercial de precios
-export const AUTHORIZED_ADMIN_EMAILS = [
-  'admin@vel.com',
-  'soporte@vel.com',
-  'pb927057@gmail.com'
-];
+const PRICING_DOC_PATH = 'configuracion_comercial/precios';
+const PRICING_HISTORY_COLLECTION = 'configuracion_comercial/precios/historial';
 
-export class FirebaseAdminConfigError extends Error {
-  public readonly code = 'FIREBASE_ADMIN_CONFIG_ERROR';
-  constructor(message: string) {
-    super(message);
-    this.name = 'FirebaseAdminConfigError';
-  }
-}
+export const DEFAULT_PRICING: PricingConfig = {
+  monto: 4500,
+  moneda: 'ARS',
+  periodicidad: 'mensual',
+  actualizadoEl: '2026-11-12T00:00:00.000Z',
+  actualizadoPor: 'sistema_inicial'
+};
 
-interface ParsedServiceAccount {
-  projectId: string;
-  clientEmail: string;
-  privateKey: string;
-}
+export type PricingUnavailableReason = 'firestore_error' | 'not_configured' | 'invalid_config';
 
-function normalizePemPrivateKey(rawKey: string): string {
-  let key = String(rawKey || '').trim();
-  if (
-    (key.startsWith('"') && key.endsWith('"')) ||
-    (key.startsWith("'") && key.endsWith("'"))
+export class PricingUnavailableError extends Error {
+  public readonly code = 'PRICING_UNAVAILABLE';
+  public readonly retryable = true;
+
+  constructor(
+    message: string,
+    public readonly reason: PricingUnavailableReason = 'firestore_error',
+    public readonly causeError?: unknown
   ) {
-    key = key.slice(1, -1).trim();
+    super(message);
+    this.name = 'PricingUnavailableError';
   }
-  key = key.replace(/\\\\n/g, '\n').replace(/\\n/g, '\n').replace(/\r\n/g, '\n').trim();
-  return key;
 }
 
-function hasPemMarkers(privateKey: string): boolean {
-  return (
-    privateKey.includes('-----BEGIN PRIVATE KEY-----') &&
-    privateKey.includes('-----END PRIVATE KEY-----')
-  );
+export function isValidCurrencyCode(currency: string): boolean {
+  return /^[A-Z]{3}$/.test(currency.trim().toUpperCase());
 }
 
-function resolveServiceAccountCredentials(): {
-  ok: boolean;
-  credentials?: ParsedServiceAccount;
-  error?: string;
-} {
-  const defaultProjectId = String(process.env.FIREBASE_PROJECT_ID || 'proyecto-vel').trim() || 'proyecto-vel';
-  const serviceAccountEnv = String(process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
+/**
+ * Obtiene el precio vigente centralizado desde el servidor (Firestore).
+ * Nunca sustituye silenciosamente con DEFAULT_PRICING si falla la lectura o falta configuración.
+ */
+export async function getCurrentPricing(dbOverride?: Firestore): Promise<PricingConfig> {
+  if (!dbOverride && !hasFirebaseAdminCredentials()) {
+    throw new PricingUnavailableError(
+      'Credenciales de Firebase Admin no configuradas en el servidor para consultar la tarifa vigente.',
+      'not_configured'
+    );
+  }
 
-  if (serviceAccountEnv) {
-    try {
-      const parsed = serviceAccountEnv.startsWith('{')
-        ? JSON.parse(serviceAccountEnv)
-        : JSON.parse(Buffer.from(serviceAccountEnv, 'base64').toString('utf8'));
+  let docSnap: DocumentSnapshot;
 
-      const clientEmail = String(parsed?.client_email || '').trim();
-      const privateKey = normalizePemPrivateKey(String(parsed?.private_key || ''));
-      const projectId = String(parsed?.project_id || defaultProjectId).trim() || defaultProjectId;
+  try {
+    const db = dbOverride || getAdminDb();
+    docSnap = await db.doc(PRICING_DOC_PATH).get();
+  } catch (err: any) {
+    throw new PricingUnavailableError(
+      `No se pudo consultar la tarifa vigente en Firestore (${PRICING_DOC_PATH}): ${err?.message || err}`,
+      'firestore_error',
+      err
+    );
+  }
 
-      if (!clientEmail || !privateKey || !hasPemMarkers(privateKey)) {
+  if (!docSnap.exists) {
+    throw new PricingUnavailableError(
+      `No existe configuración de tarifa vigente en Firestore (${PRICING_DOC_PATH}).`,
+      'not_configured'
+    );
+  }
+
+  const data = docSnap.data() as Partial<PricingConfig> | undefined;
+  const monto = Number(data?.monto);
+  const moneda = typeof data?.moneda === 'string' ? data.moneda.trim().toUpperCase() : '';
+
+  if (!Number.isFinite(monto) || monto <= 0 || !isValidCurrencyCode(moneda)) {
+    throw new PricingUnavailableError(
+      `La tarifa vigente registrada en Firestore (${PRICING_DOC_PATH}) es inválida o está incompleta.`,
+      'invalid_config'
+    );
+  }
+
+  return {
+    monto,
+    moneda,
+    periodicidad: 'mensual',
+    actualizadoEl: data?.actualizadoEl || new Date().toISOString(),
+    actualizadoPor: data?.actualizadoPor || 'administrador',
+    motivoCambio: data?.motivoCambio
+  };
+}
+
+/**
+ * Inicializa de forma única y transaccional configuracion_comercial/precios por decisión explícita
+ * de un administrador. Nunca sobrescribe una configuración vigente existente ni modifica precios
+ * históricos de suscriptores.
+ */
+export async function initializePricing(
+  montoInicial: number,
+  monedaInicial: string,
+  adminEmail: string,
+  motivoCambio?: string,
+  dbOverride?: Firestore
+): Promise<{ created: boolean; alreadyInitialized: boolean; pricing: PricingConfig }> {
+  const monto = Number(montoInicial);
+  const moneda = String(monedaInicial || '').toUpperCase().trim();
+
+  if (!Number.isFinite(monto) || monto <= 0) {
+    throw new Error('El monto inicial debe ser un número finito mayor a 0.');
+  }
+  if (!isValidCurrencyCode(moneda)) {
+    throw new Error('La moneda inicial debe ser un código ISO de 3 letras válido (ej. ARS).');
+  }
+
+  const db = dbOverride || getAdminDb();
+  const nowIso = new Date().toISOString();
+
+  return db.runTransaction(async (tx) => {
+    const docRef = db.doc(PRICING_DOC_PATH);
+    const snap = await tx.get(docRef);
+
+    if (snap.exists) {
+      const existing = snap.data() as Partial<PricingConfig> | undefined;
+      const existingMonto = Number(existing?.monto);
+      const existingMoneda =
+        typeof existing?.moneda === 'string' ? existing.moneda.trim().toUpperCase() : '';
+
+      if (Number.isFinite(existingMonto) && existingMonto > 0 && isValidCurrencyCode(existingMoneda)) {
         return {
-          ok: false,
-          error:
-            'FIREBASE_SERVICE_ACCOUNT no contiene un client_email o una clave privada PEM válida.'
+          created: false,
+          alreadyInitialized: true,
+          pricing: {
+            monto: existingMonto,
+            moneda: existingMoneda,
+            periodicidad: 'mensual',
+            actualizadoEl: existing?.actualizadoEl || nowIso,
+            actualizadoPor: existing?.actualizadoPor || 'administrador',
+            motivoCambio: existing?.motivoCambio
+          }
         };
       }
-
-      return {
-        ok: true,
-        credentials: { projectId, clientEmail, privateKey }
-      };
-    } catch {
-      return {
-        ok: false,
-        error: 'No se pudo interpretar FIREBASE_SERVICE_ACCOUNT (JSON/Base64 inválido).'
-      };
-    }
-  }
-
-  const clientEmail = String(process.env.FIREBASE_CLIENT_EMAIL || '').trim();
-  const rawPrivateKey = String(process.env.FIREBASE_PRIVATE_KEY || '').trim();
-
-  if (clientEmail || rawPrivateKey) {
-    if (!clientEmail || !rawPrivateKey) {
-      return {
-        ok: false,
-        error:
-          'Configuración incompleta en Netlify: debes definir tanto FIREBASE_CLIENT_EMAIL como FIREBASE_PRIVATE_KEY (o FIREBASE_SERVICE_ACCOUNT).'
-      };
     }
 
-    const privateKey = normalizePemPrivateKey(rawPrivateKey);
-    if (!hasPemMarkers(privateKey)) {
-      return {
-        ok: false,
-        error:
-          'FIREBASE_PRIVATE_KEY no tiene formato PEM válido (faltan cabeceras BEGIN/END PRIVATE KEY).'
-      };
-    }
-
-    return {
-      ok: true,
-      credentials: {
-        projectId: defaultProjectId,
-        clientEmail,
-        privateKey
-      }
+    const initialConfig: PricingConfig = {
+      monto,
+      moneda,
+      periodicidad: 'mensual',
+      actualizadoEl: nowIso,
+      actualizadoPor: adminEmail,
+      motivoCambio: motivoCambio || 'Inicialización comercial de tarifa vigente'
     };
-  }
 
-  return {
-    ok: false,
-    error:
-      'Configuración pendiente en Netlify: falta configurar FIREBASE_SERVICE_ACCOUNT o FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY.'
-  };
-}
-
-/**
- * Comprueba si existen credenciales de Firebase Admin SDK utilizables en el entorno
- * (ya sea FIREBASE_SERVICE_ACCOUNT o bien FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY).
- */
-export function hasFirebaseAdminCredentials(): boolean {
-  return resolveServiceAccountCredentials().ok;
-}
-
-export function initFirebaseAdmin(): App {
-  const apps = getApps();
-  if (apps.length > 0 && apps[0]) {
-    return apps[0];
-  }
-
-  const resolved = resolveServiceAccountCredentials();
-  if (!resolved.ok || !resolved.credentials) {
-    throw new FirebaseAdminConfigError(
-      resolved.error || 'Credenciales de Firebase Admin SDK no disponibles.'
-    );
-  }
-
-  try {
-    return initializeApp({
-      credential: cert({
-        projectId: resolved.credentials.projectId,
-        clientEmail: resolved.credentials.clientEmail,
-        privateKey: resolved.credentials.privateKey
-      }),
-      projectId: resolved.credentials.projectId
+    const historyRef = db.collection(PRICING_HISTORY_COLLECTION).doc();
+    tx.set(docRef, initialConfig);
+    tx.set(historyRef, {
+      ...initialConfig,
+      timestamp: nowIso
     });
-  } catch (err: any) {
-    throw new FirebaseAdminConfigError(
-      `No se pudo inicializar Firebase Admin SDK con la clave configurada: ${err?.message || err}`
-    );
-  }
-}
-
-export function getAdminDb(): Firestore {
-  const app = initFirebaseAdmin();
-  return getFirestore(app);
-}
-
-export function getAdminAuth(): Auth {
-  const app = initFirebaseAdmin();
-  return getAuth(app);
-}
-
-export type TokenVerificationResult =
-  | { authenticated: true; uid: string; email: string }
-  | {
-      authenticated: false;
-      reason: 'missing_token' | 'invalid_token' | 'pending_config';
-      message: string;
-    };
-
-/**
- * Verificación estricta de Firebase ID Token mediante Firebase Admin SDK.
- * Distingue errores de configuración/credencial del servidor (pending_config -> 503)
- * de tokens realmente inválidos o expirados (invalid_token -> 401).
- */
-export async function verifyUserTokenStrict(authHeader?: string): Promise<TokenVerificationResult> {
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return {
-      authenticated: false,
-      reason: 'missing_token',
-      message: 'No autorizado. Debes iniciar sesión para continuar.'
-    };
-  }
-
-  const token = authHeader.substring(7).trim();
-  if (!token) {
-    return {
-      authenticated: false,
-      reason: 'missing_token',
-      message: 'Token de sesión vacío.'
-    };
-  }
-
-  let auth: Auth;
-  try {
-    auth = getAdminAuth();
-  } catch (err: any) {
-    console.warn('Error de configuración Firebase Admin SDK:', err?.message || err);
-    return {
-      authenticated: false,
-      reason: 'pending_config',
-      message:
-        err?.message ||
-        'Configuración pendiente en Netlify: falta configurar FIREBASE_SERVICE_ACCOUNT (o FIREBASE_CLIENT_EMAIL y FIREBASE_PRIVATE_KEY) para verificar tokens en el servidor.'
-    };
-  }
-
-  try {
-    const decoded = await auth.verifyIdToken(token);
-    if (!decoded || !decoded.uid) {
-      return {
-        authenticated: false,
-        reason: 'invalid_token',
-        message: 'Token de Firebase inválido.'
-      };
-    }
 
     return {
-      authenticated: true,
-      uid: decoded.uid,
-      email: decoded.email || ''
+      created: true,
+      alreadyInitialized: false,
+      pricing: initialConfig
     };
-  } catch (err: any) {
-    console.warn('Rechazo de ID Token de Firebase:', err?.message || err);
-    return {
-      authenticated: false,
-      reason: 'invalid_token',
-      message: 'Token de Firebase inválido o expirado.'
-    };
-  }
+  });
 }
 
 /**
- * Compatibilidad para funciones existentes: retorna { uid, email } o null si no es válido.
+ * Actualiza el precio oficial para nuevas suscripciones y registra la entrada en el historial
+ * REGLA COMERCIAL: Los suscriptores existentes conservan su precio de contratación original.
  */
-export async function verifyUserToken(authHeader?: string): Promise<{ uid: string; email?: string } | null> {
-  const result = await verifyUserTokenStrict(authHeader);
-  if (!result.authenticated) {
-    return null;
+export async function updatePricing(
+  nuevoMonto: number,
+  nuevaMoneda: string,
+  adminEmail: string,
+  motivoCambio?: string,
+  dbOverride?: Firestore
+): Promise<PricingConfig> {
+  const monto = Number(nuevoMonto);
+  const moneda = String(nuevaMoneda || '').toUpperCase().trim();
+  if (!Number.isFinite(monto) || monto <= 0) {
+    throw new Error('El monto mensual debe ser un número finito mayor a 0.');
   }
-  return {
-    uid: result.uid,
-    email: result.email
+  if (!isValidCurrencyCode(moneda)) {
+    throw new Error('La moneda debe ser un código ISO de 3 letras válido (ej. ARS).');
+  }
+
+  const db = dbOverride || getAdminDb();
+  const nowIso = new Date().toISOString();
+
+  const newConfig: PricingConfig = {
+    monto,
+    moneda,
+    periodicidad: 'mensual',
+    actualizadoEl: nowIso,
+    actualizadoPor: adminEmail,
+    motivoCambio: motivoCambio || 'Actualización comercial de tarifa'
   };
+
+  // 1. Guardar precio vigente
+  await db.doc(PRICING_DOC_PATH).set(newConfig, { merge: true });
+
+  // 2. Asentar en historial inmutable de precios
+  await db.collection(PRICING_HISTORY_COLLECTION).add({
+    ...newConfig,
+    timestamp: nowIso
+  });
+
+  return newConfig;
 }
 
 /**
- * Valida si un usuario posee privilegios de administración comercial
+ * Obtiene el historial de modificaciones de precios
  */
-export function isUserAdmin(email?: string, customClaims?: any): boolean {
-  if (customClaims && customClaims.admin === true) {
-    return true;
+export async function getPricingHistory(
+  limitCount: number = 20,
+  dbOverride?: Firestore
+): Promise<PricingHistoryEntry[]> {
+  try {
+    if (!dbOverride && !hasFirebaseAdminCredentials()) {
+      return [];
+    }
+    const db = dbOverride || getAdminDb();
+    const snap = await db
+      .collection(PRICING_HISTORY_COLLECTION)
+      .orderBy('actualizadoEl', 'desc')
+      .limit(limitCount)
+      .get();
+
+    return snap.docs.map((d: any) => ({
+      id: d.id,
+      ...(d.data() as PricingConfig)
+    }));
+  } catch (err) {
+    console.warn('Error al leer historial de precios:', err);
+    return [];
   }
-  if (!email) return false;
-  const cleanEmail = email.toLowerCase().trim();
-  return AUTHORIZED_ADMIN_EMAILS.includes(cleanEmail);
 }
